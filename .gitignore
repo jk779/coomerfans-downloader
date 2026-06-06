@@ -1,0 +1,10 @@
+.DS_Store
+
+Gemfile.lock
+/downloads/*
+!/downloads/.gitkeep
+*.mp4.part
+*.mp4
+
+/dist/*
+!/dist/.gitkeep
