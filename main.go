@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cavaliergopher/grab/v3"
+
 	"golang.org/x/net/html"
 )
 
@@ -71,13 +73,10 @@ var (
 		},
 	}
 	downloadClient = &http.Client{
-		Timeout: 300 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return fmt.Errorf("too many redirects")
-			}
-			applyHeaders(req)
-			return nil
+		// No overall Timeout – ResponseHeaderTimeout only limits waiting
+		// for the first response byte; body transfer runs until completion.
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: 60 * time.Second,
 		},
 	}
 )
@@ -387,6 +386,7 @@ func filenameFor(title, rawURL string, index int) string {
 type dlStats struct {
 	downloaded *atomic.Int64
 	active     *atomic.Int64
+	totalBytes *atomic.Int64
 	queued     func() int // returns current queue length
 }
 
@@ -395,106 +395,107 @@ func (s dlStats) format() string {
 		s.queued(), s.active.Load(), s.downloaded.Load())
 }
 
+func (s dlStats) summary(elapsed time.Duration) string {
+	mb := float64(s.totalBytes.Load()) / 1024 / 1024
+	mbps := mb / elapsed.Seconds()
+	return fmt.Sprintf("[status] active: %d, done: %d, %.1f MB total @ %.1f MB/s",
+		s.active.Load(), s.downloaded.Load(), mb, mbps)
+}
+
+func buildDownloadRequest(rawURL string) (*http.Request, error) {
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Use video-specific headers for signed URLs (e= and hash= params),
+	// normal scrape headers for plain URLs (e.g. /storager/ without params)
+	parsedURL, _ := url.Parse(rawURL)
+	q := parsedURL.Query()
+	if q.Get("e") != "" && q.Get("hash") != "" {
+		req.Header.Set("User-Agent", httpHeaders["User-Agent"])
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Accept-Encoding", "identity;q=1, *;q=0")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.6")
+		req.Header.Set("Referer", rawURL)
+		req.Header.Set("Sec-Ch-Ua", `"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"`)
+		req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+		req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
+		req.Header.Set("Sec-Fetch-Dest", "video")
+		req.Header.Set("Sec-Fetch-Mode", "no-cors")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.Header.Set("Sec-Gpc", "1")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Pragma", "no-cache")
+	} else {
+		for k, v := range httpHeaders {
+			req.Header.Set(k, v)
+		}
+	}
+	return req, nil
+}
+
 func downloadVideo(rawURL, title, postURL string, index int, outputDir string, stats dlStats, mu *sync.Mutex) {
 	stats.active.Add(1)
 	defer stats.active.Add(-1)
 
 	filename := filenameFor(title, rawURL, index)
 	dest := filepath.Join(outputDir, filename)
-	part := dest + ".part"
+
+	grabClient := grab.NewClient()
+	grabClient.HTTPClient = downloadClient
+
+	// errorf prints a consistent error block with file context and bytes downloaded so far
+	errorf := func(soFar int64, format string, args ...any) {
+		mu.Lock()
+		fmt.Printf("\n  "+tag(colRed, "error")+" "+format+" %s\n  -> title: %q\n  -> post:  %s\n  -> video: %s\n  -> downloaded so far: %.1f MB\n",
+			append(args, stats.format(), title, postURL, rawURL, float64(soFar)/1024/1024)...)
+		mu.Unlock()
+	}
 
 	retries := 0
 	for {
-		req, err := http.NewRequest("GET", rawURL, nil)
+		req, err := grab.NewRequest(dest, rawURL)
 		if err != nil {
-			mu.Lock()
-			fmt.Printf("  "+tag(colRed, "error")+" %v %s\n", err, stats.format())
-			mu.Unlock()
+			errorf(0, "%v", err)
 			return
 		}
-		// Use video-specific headers for signed URLs (e= and hash= params),
-		// normal scrape headers for plain URLs (e.g. /storager/ without params)
-		parsedURL, _ := url.Parse(rawURL)
-		q := parsedURL.Query()
-		if q.Get("e") != "" && q.Get("hash") != "" {
-			req.Header.Set("User-Agent", httpHeaders["User-Agent"])
-			req.Header.Set("Accept", "*/*")
-			req.Header.Set("Accept-Encoding", "identity;q=1, *;q=0")
-			req.Header.Set("Accept-Language", "en-US,en;q=0.6")
-			req.Header.Set("Range", "bytes=0-")
-			req.Header.Set("Referer", rawURL) // video URL as referer
-			req.Header.Set("Sec-Ch-Ua", `"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"`)
-			req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-			req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
-			req.Header.Set("Sec-Fetch-Dest", "video")
-			req.Header.Set("Sec-Fetch-Mode", "no-cors")
-			req.Header.Set("Sec-Fetch-Site", "same-origin")
-			req.Header.Set("Sec-Gpc", "1")
-			req.Header.Set("Cache-Control", "no-cache")
-			req.Header.Set("Pragma", "no-cache")
-		} else {
-			applyHeaders(req)
-		}
 
-		resp, err := downloadClient.Do(req)
+		// Apply correct headers via a pre-built http.Request
+		httpReq, err := buildDownloadRequest(rawURL)
 		if err != nil {
-			mu.Lock()
-			fmt.Printf("\n  "+tag(colRed, "error")+" %v %s\n  -> title: %q\n  -> post:  %s\n  -> video: %s\n", err, stats.format(), title, postURL, rawURL)
-			mu.Unlock()
+			errorf(0, "%v", err)
+			return
+		}
+		req.HTTPRequest.Header = httpReq.Header
+
+		resp := grabClient.Do(req)
+		if err := resp.Err(); err != nil {
+			soFar := resp.BytesComplete()
+			if resp.HTTPResponse != nil && resp.HTTPResponse.StatusCode == 429 {
+				if retries >= 10 {
+					errorf(soFar, "gave up after 10 retries for %q", title)
+					return
+				}
+				retries++
+				wait := time.Duration(min(1<<retries*10, 300)) * time.Second
+				mu.Lock()
+				fmt.Printf("\n  "+tag(colRed, "429")+" rate limited, waiting %ds (attempt %d/10) for %q...\n",
+					int(wait.Seconds()), retries, title)
+				mu.Unlock()
+				time.Sleep(wait)
+				continue
+			}
+			errorf(soFar, "%v", err)
 			return
 		}
 
-		switch resp.StatusCode {
-		case 200, 206:
-			f, err := os.Create(part)
-			if err != nil {
-				resp.Body.Close()
-				mu.Lock()
-				fmt.Printf("  "+tag(colRed, "error")+" %v %s\n", err, stats.format())
-				mu.Unlock()
-				return
-			}
-			size, err := io.Copy(f, resp.Body)
-			f.Close()
-			resp.Body.Close()
-			if err != nil {
-				os.Remove(part)
-				mu.Lock()
-				fmt.Printf("\n  "+tag(colRed, "error")+" %v %s\n  -> title: %q\n  -> post:  %s\n  -> video: %s\n", err, stats.format(), title, postURL, rawURL)
-				mu.Unlock()
-				return
-			}
-			os.Rename(part, dest)
-			stats.downloaded.Add(1)
-			mu.Lock()
-			fmt.Printf("\n  "+tag(colGreen, "done")+" %s (%.1f MB) %s\n", filename, float64(size)/1024/1024, stats.format())
-			mu.Unlock()
-			return
-
-		case 429:
-			resp.Body.Close()
-			if retries >= 10 {
-				mu.Lock()
-				fmt.Printf("  "+tag(colRed, "error")+" gave up after 10 retries for %q %s\n", title, stats.format())
-				mu.Unlock()
-				os.Remove(part)
-				return
-			}
-			retries++
-			wait := time.Duration(min(1<<retries*10, 300)) * time.Second
-			mu.Lock()
-			fmt.Printf("\n  "+tag(colRed, "429")+" rate limited, waiting %ds (attempt %d/10) for %q...\n",
-				int(wait.Seconds()), retries, title)
-			mu.Unlock()
-			time.Sleep(wait)
-
-		default:
-			resp.Body.Close()
-			mu.Lock()
-			fmt.Printf("  "+tag(colRed, "error")+" HTTP %d downloading %s %s\n", resp.StatusCode, filename, stats.format())
-			mu.Unlock()
-			return
-		}
+		stats.downloaded.Add(1)
+		stats.totalBytes.Add(resp.Size())
+		mu.Lock()
+		fmt.Printf("\n  "+tag(colGreen, "done")+" %s (%.1f MB) %s\n",
+			filename, float64(resp.Size())/1024/1024, stats.format())
+		mu.Unlock()
+		return
 	}
 }
 
@@ -593,6 +594,7 @@ func main() {
 	stats := dlStats{
 		downloaded: &atomic.Int64{},
 		active:     &atomic.Int64{},
+		totalBytes: &atomic.Int64{},
 		queued:     func() int { return len(queue) },
 	}
 	var totalVideos int
@@ -608,6 +610,18 @@ func main() {
 			}
 		}()
 	}
+
+	// Background status ticker
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		start := time.Now()
+		for range ticker.C {
+			mu.Lock()
+			fmt.Printf("\n  "+tag(colCyan, "status")+" %s\n", stats.summary(time.Since(start)))
+			mu.Unlock()
+		}
+	}()
 
 	spinner := []string{"|", "/", "-", `\`}
 	spinIdx := 0
