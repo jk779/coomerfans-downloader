@@ -380,13 +380,6 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 	dest := filepath.Join(outputDir, filename)
 	part := dest + ".part"
 
-	if _, err := os.Stat(dest); err == nil {
-		mu.Lock()
-		fmt.Printf("  "+tag(colTeal, "skip")+" %s (already exists) %s\n", filename, stats.format())
-		mu.Unlock()
-		return
-	}
-
 	retries := 0
 	for {
 		req, err := http.NewRequest("GET", rawURL, nil)
@@ -592,6 +585,15 @@ func main() {
 		for _, u := range result.videos {
 			totalVideos++
 			item := queueItem{url: u, title: result.title, index: totalVideos}
+
+			// Skip early if file already exists
+			dest := filepath.Join(outputDir, filenameFor(item.title, item.url, item.index))
+			if _, err := os.Stat(dest); err == nil {
+				mu.Lock()
+				fmt.Printf("  "+tag(colTeal, "skip")+" %s (already exists)\n", item.title)
+				mu.Unlock()
+				continue
+			}
 
 			// Non-blocking send; if full, spin until a slot opens
 			for {
