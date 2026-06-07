@@ -6,15 +6,17 @@ set -euo pipefail
 # Default targets: darwin/arm64, linux/amd64, windows/amd64
 #
 # Usage:
-#   ./compile.sh                                      # build defaults
+#   ./compile.sh                                          # build defaults
 #   ./compile.sh --arch darwin/arm64 --arch linux/amd64  # build specific targets only
+#   ./compile.sh --version 1.2.0                         # set version string
 #
-# Valid GOOS values:  darwin, linux, windows, freebsd, ...
+# Valid GOOS values:   darwin, linux, windows, freebsd, ...
 # Valid GOARCH values: amd64, arm64, 386, arm, ...
 # Format: GOOS/GOARCH  e.g. darwin/arm64, windows/amd64
 
 BINARY_NAME="coomerfans"
 OUT_DIR="./dist"
+VERSION="1.0.0"
 
 DEFAULT_TARGETS=(
   "darwin/arm64"
@@ -26,13 +28,14 @@ DEFAULT_TARGETS=(
 
 usage() {
   cat << HELP
-Usage: $0 [--arch GOOS/GOARCH] ...
+Usage: $0 [--arch GOOS/GOARCH] [--version X.Y.Z] ...
 
 Cross-compiles ${BINARY_NAME} for one or more platforms.
 With no --arch flags the default targets are built.
 
 Options:
   --arch GOOS/GOARCH   Add a target (repeatable)
+  --version X.Y.Z      Set version string (default: ${VERSION})
   --help               Show this help
 
 Default targets:
@@ -52,18 +55,23 @@ All valid GOARCH values: amd64 arm64 386 arm mips mips64 riscv64 s390x wasm
 
 Examples:
   $0
+  $0 --version 1.2.0
   $0 --arch darwin/arm64 --arch windows/arm64
-  $0 --arch linux/amd64 --arch linux/arm64
+  $0 --version 2.0.0 --arch linux/amd64 --arch linux/arm64
 HELP
 }
 
-# ── Parse --arch flags ────────────────────────────────────────────────────────
+# ── Parse args ────────────────────────────────────────────────────────────────
 
 targets=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --arch)
       targets+=("$2")
+      shift 2
+      ;;
+    --version)
+      VERSION="$2"
       shift 2
       ;;
     --help|-h)
@@ -86,6 +94,8 @@ fi
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 mkdir -p "$OUT_DIR"
+echo "Building version ${VERSION}..."
+echo
 
 for target in "${targets[@]}"; do
   IFS='/' read -r goos goarch <<< "$target"
@@ -95,7 +105,6 @@ for target in "${targets[@]}"; do
     continue
   fi
 
-  # Append .exe for Windows binaries
   ext=""
   [[ "$goos" == "windows" ]] && ext=".exe"
 
@@ -103,7 +112,9 @@ for target in "${targets[@]}"; do
 
   printf "  building %-20s -> %s\n" "${goos}/${goarch}" "$out"
 
-  GOOS="$goos" GOARCH="$goarch" go build -o "$out" .
+  GOOS="$goos" GOARCH="$goarch" go build \
+    -ldflags "-X main.version=${VERSION}" \
+    -o "$out" .
 done
 
 echo
