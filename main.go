@@ -81,28 +81,42 @@ func applyHeaders(req *http.Request) {
 
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
-func fetch(rawURL string) (string, error) {
-	req, err := http.NewRequest("GET", rawURL, nil)
-	if err != nil {
-		return "", err
+func fetch(rawURL string, retries ...int) (string, error) {
+	maxRetries := 3
+	if len(retries) > 0 {
+		maxRetries = retries[0]
 	}
-	applyHeaders(req)
+	lastStatus := 0
+	for attempt := range maxRetries {
+		req, err := http.NewRequest("GET", rawURL, nil)
+		if err != nil {
+			return "", err
+		}
+		applyHeaders(req)
 
-	resp, err := scrapeClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+		resp, err := scrapeClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+		switch resp.StatusCode {
+		case 200:
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return "", err
+			}
+			return string(body), nil
+		case 500, 502, 503, 504:
+			lastStatus = resp.StatusCode
+			wait := time.Duration(attempt+1) * 5 * time.Second
+			fmt.Printf("\n  "+tag(colYellow, "warn")+" HTTP %d, retrying in %ds...\n", resp.StatusCode, int(wait.Seconds()))
+			time.Sleep(wait)
+		default:
+			return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
 	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
+	return "", fmt.Errorf("HTTP %d after %d retries", lastStatus, maxRetries)
 }
 
 func absURL(base, href string) string {
