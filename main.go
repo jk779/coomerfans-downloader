@@ -71,7 +71,7 @@ var (
 		},
 	}
 	downloadClient = &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 300 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects")
@@ -395,7 +395,7 @@ func (s dlStats) format() string {
 		s.queued(), s.active.Load(), s.downloaded.Load())
 }
 
-func downloadVideo(rawURL, title string, index int, outputDir string, stats dlStats, mu *sync.Mutex) {
+func downloadVideo(rawURL, title, postURL string, index int, outputDir string, stats dlStats, mu *sync.Mutex) {
 	stats.active.Add(1)
 	defer stats.active.Add(-1)
 
@@ -412,18 +412,40 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 			mu.Unlock()
 			return
 		}
-		applyHeaders(req)
+		// Use video-specific headers for signed URLs (e= and hash= params),
+		// normal scrape headers for plain URLs (e.g. /storager/ without params)
+		parsedURL, _ := url.Parse(rawURL)
+		q := parsedURL.Query()
+		if q.Get("e") != "" && q.Get("hash") != "" {
+			req.Header.Set("User-Agent", httpHeaders["User-Agent"])
+			req.Header.Set("Accept", "*/*")
+			req.Header.Set("Accept-Encoding", "identity;q=1, *;q=0")
+			req.Header.Set("Accept-Language", "en-US,en;q=0.6")
+			req.Header.Set("Range", "bytes=0-")
+			req.Header.Set("Referer", rawURL) // video URL as referer
+			req.Header.Set("Sec-Ch-Ua", `"Brave";v="149", "Chromium";v="149", "Not)A;Brand";v="24"`)
+			req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+			req.Header.Set("Sec-Ch-Ua-Platform", `"macOS"`)
+			req.Header.Set("Sec-Fetch-Dest", "video")
+			req.Header.Set("Sec-Fetch-Mode", "no-cors")
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+			req.Header.Set("Sec-Gpc", "1")
+			req.Header.Set("Cache-Control", "no-cache")
+			req.Header.Set("Pragma", "no-cache")
+		} else {
+			applyHeaders(req)
+		}
 
 		resp, err := downloadClient.Do(req)
 		if err != nil {
 			mu.Lock()
-			fmt.Printf("  "+tag(colRed, "error")+" %v %s\n  -> %q\n", err, stats.format(), title)
+			fmt.Printf("\n  "+tag(colRed, "error")+" %v %s\n  -> title: %q\n  -> post:  %s\n  -> video: %s\n", err, stats.format(), title, postURL, rawURL)
 			mu.Unlock()
 			return
 		}
 
 		switch resp.StatusCode {
-		case 200:
+		case 200, 206:
 			f, err := os.Create(part)
 			if err != nil {
 				resp.Body.Close()
@@ -438,14 +460,14 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 			if err != nil {
 				os.Remove(part)
 				mu.Lock()
-				fmt.Printf("  "+tag(colRed, "error")+" %v %s\n", err, stats.format())
+				fmt.Printf("\n  "+tag(colRed, "error")+" %v %s\n  -> title: %q\n  -> post:  %s\n  -> video: %s\n", err, stats.format(), title, postURL, rawURL)
 				mu.Unlock()
 				return
 			}
 			os.Rename(part, dest)
 			stats.downloaded.Add(1)
 			mu.Lock()
-			fmt.Printf("  "+tag(colGreen, "done")+" %s (%.1f MB) %s\n", filename, float64(size)/1024/1024, stats.format())
+			fmt.Printf("\n  "+tag(colGreen, "done")+" %s (%.1f MB) %s\n", filename, float64(size)/1024/1024, stats.format())
 			mu.Unlock()
 			return
 
@@ -560,9 +582,10 @@ func main() {
 	fmt.Printf("Step 2: scraping + downloading (max %d concurrent downloads)...\n\n", maxDownloads)
 
 	type queueItem struct {
-		url   string
-		title string
-		index int
+		url     string
+		title   string
+		postURL string
+		index   int
 	}
 	queue := make(chan queueItem, queueMax)
 
@@ -581,7 +604,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for item := range queue {
-				downloadVideo(item.url, item.title, item.index, outputDir, stats, &mu)
+				downloadVideo(item.url, item.title, item.postURL, item.index, outputDir, stats, &mu)
 			}
 		}()
 	}
@@ -605,15 +628,19 @@ func main() {
 		}
 		mu.Unlock()
 
-		for _, u := range result.videos {
+		for vi, u := range result.videos {
 			totalVideos++
-			item := queueItem{url: u, title: result.title, index: totalVideos}
+			itemTitle := result.title
+			if len(result.videos) > 1 {
+				itemTitle = fmt.Sprintf("%s (%d)", result.title, vi+1)
+			}
+			item := queueItem{url: u, title: itemTitle, postURL: postURL, index: totalVideos}
 
 			// Skip early if file already exists
 			dest := filepath.Join(outputDir, filenameFor(item.title, item.url, item.index))
 			if _, err := os.Stat(dest); err == nil {
 				mu.Lock()
-				fmt.Printf("  "+tag(colTeal, "skip")+" %s (already exists)\n", item.title)
+				fmt.Printf("\n  "+tag(colTeal, "skip")+" %s (already exists)\n", item.title)
 				mu.Unlock()
 				continue
 			}
@@ -623,7 +650,7 @@ func main() {
 				select {
 				case queue <- item:
 					mu.Lock()
-					fmt.Printf("  "+tag(colCyan, "enqueued")+" %s %s\n", item.title, stats.format())
+					fmt.Printf("\n  "+tag(colCyan, "enqueued")+" %s %s\n", item.title, stats.format())
 					mu.Unlock()
 					goto nextVideo
 				default:
