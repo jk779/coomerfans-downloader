@@ -54,8 +54,8 @@ var (
 	multiSpaceRe = regexp.MustCompile(`\s+`)
 
 	httpHeaders = map[string]string{
-		"User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
 		"Accept-Language": "en-US,en;q=0.9",
 		"Referer":         "https://coomerfans.com/",
 	}
@@ -220,7 +220,7 @@ type postResult struct {
 func extractVideos(postURL string) postResult {
 	body, err := fetch(postURL)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "  "+tag(colYellow, "warn")+" fetch error for %s: %v\n", postURL, err)
+		fmt.Printf("  "+tag(colYellow, "warn")+" fetch error for %s: %v\n", postURL, err)
 		return postResult{}
 	}
 
@@ -279,7 +279,7 @@ func collectPostLinks(creatorURL string) []string {
 
 		body, err := fetch(pageURL)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "  "+tag(colYellow, "warn")+" %v\n", err)
+			fmt.Printf("  "+tag(colYellow, "warn")+" %v\n", err)
 			break
 		}
 
@@ -385,7 +385,7 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 		req, err := http.NewRequest("GET", rawURL, nil)
 		if err != nil {
 			mu.Lock()
-			fmt.Fprintf(os.Stderr, "  "+tag(colRed, "error")+" %v %s\n", err, stats.format())
+			fmt.Printf("  "+tag(colRed, "error")+" %v %s\n", err, stats.format())
 			mu.Unlock()
 			return
 		}
@@ -394,7 +394,7 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 		resp, err := downloadClient.Do(req)
 		if err != nil {
 			mu.Lock()
-			fmt.Fprintf(os.Stderr, "  [error] %v %s\n", err, stats.format())
+			fmt.Printf("  "+tag(colRed, "error")+" %v %s\n", err, stats.format())
 			mu.Unlock()
 			return
 		}
@@ -405,7 +405,7 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 			if err != nil {
 				resp.Body.Close()
 				mu.Lock()
-				fmt.Fprintf(os.Stderr, "  [error] %v %s\n", err, stats.format())
+				fmt.Printf("  "+tag(colRed, "error")+" %v %s\n", err, stats.format())
 				mu.Unlock()
 				return
 			}
@@ -415,7 +415,7 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 			if err != nil {
 				os.Remove(part)
 				mu.Lock()
-				fmt.Fprintf(os.Stderr, "  [error] %v %s\n", err, stats.format())
+				fmt.Printf("  "+tag(colRed, "error")+" %v %s\n", err, stats.format())
 				mu.Unlock()
 				return
 			}
@@ -430,7 +430,7 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 			resp.Body.Close()
 			if retries >= 10 {
 				mu.Lock()
-				fmt.Fprintf(os.Stderr, "  "+tag(colRed, "error")+" gave up after 10 retries for %q %s\n", title, stats.format())
+				fmt.Printf("  "+tag(colRed, "error")+" gave up after 10 retries for %q %s\n", title, stats.format())
 				mu.Unlock()
 				os.Remove(part)
 				return
@@ -438,7 +438,7 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 			retries++
 			wait := time.Duration(min(1<<retries*10, 300)) * time.Second
 			mu.Lock()
-			fmt.Fprintf(os.Stderr, "\n  "+tag(colRed, "429")+" rate limited, waiting %ds (attempt %d/10) for %q...\n",
+			fmt.Printf("\n  "+tag(colRed, "429")+" rate limited, waiting %ds (attempt %d/10) for %q...\n",
 				int(wait.Seconds()), retries, title)
 			mu.Unlock()
 			time.Sleep(wait)
@@ -446,7 +446,7 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 		default:
 			resp.Body.Close()
 			mu.Lock()
-			fmt.Fprintf(os.Stderr, "  "+tag(colRed, "error")+" HTTP %d downloading %s %s\n", resp.StatusCode, filename, stats.format())
+			fmt.Printf("  "+tag(colRed, "error")+" HTTP %d downloading %s %s\n", resp.StatusCode, filename, stats.format())
 			mu.Unlock()
 			return
 		}
