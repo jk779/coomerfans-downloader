@@ -70,7 +70,16 @@ var (
 			return nil
 		},
 	}
-	downloadClient = &http.Client{Timeout: 30 * time.Second}
+	downloadClient = &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("too many redirects")
+			}
+			applyHeaders(req)
+			return nil
+		},
+	}
 )
 
 func applyHeaders(req *http.Request) {
@@ -408,7 +417,7 @@ func downloadVideo(rawURL, title string, index int, outputDir string, stats dlSt
 		resp, err := downloadClient.Do(req)
 		if err != nil {
 			mu.Lock()
-			fmt.Printf("  "+tag(colRed, "error")+" %v %s\n", err, stats.format())
+			fmt.Printf("  "+tag(colRed, "error")+" %v %s\n  -> %q\n", err, stats.format(), title)
 			mu.Unlock()
 			return
 		}
@@ -583,16 +592,16 @@ func main() {
 	// Scrape + enqueue
 	for i, postURL := range postLinks {
 		mu.Lock()
-		fmt.Printf("  "+bold+colDefault+"[%d/%d]"+reset+" scraping %s ... ", i+1, len(postLinks), postURL)
+		fmt.Printf("\n  "+bold+colDefault+"[%d/%d]"+reset+" scraping %s\n", i+1, len(postLinks), postURL)
 		mu.Unlock()
 
 		result := extractVideos(postURL)
 
 		mu.Lock()
 		if len(result.videos) > 0 {
-			fmt.Printf("%d video(s) %q\n", len(result.videos), result.title)
+			fmt.Printf("  -> %d video(s) %q\n", len(result.videos), result.title)
 		} else {
-			fmt.Println("no video")
+			fmt.Println("  -> no video")
 		}
 		mu.Unlock()
 
