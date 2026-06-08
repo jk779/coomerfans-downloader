@@ -534,7 +534,7 @@ func main() {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--help", "-h":
-			fmt.Printf(`coomerfans-crawler %s – download videos from coomerfans.com creator pages
+			fmt.Printf(`coomerfans-video-downloader %s – download videos from coomerfans.com creator pages
 
 Usage:
   coomerfans [creator_url] [options]
@@ -578,9 +578,13 @@ Examples:
 	queueMax = maxDownloads + maxDownloads/2
 
 	if creatorURL == "" {
-		fmt.Printf("coomerfans-crawler %s – download videos from coomerfans.com\n", version)
+		fmt.Printf("coomerfans-video-downloader %s – download videos from coomerfans.com\n", version)
 		fmt.Println("Run with --help for usage information.")
 		fmt.Println()
+		if maxDownloads > 20 {
+			fmt.Printf("\033[1;31mWarning: concurrency set to %d, which may cause server overload. This is bad for everyone. Consider using a lower value.\033[0m\n\n", maxDownloads)
+		}
+
 		creatorURL = prompt("Enter creator URL (e.g. https://coomerfans.com/u/onlyfans/1234567/hotbabe96): ")
 	}
 	if creatorURL == "" {
@@ -596,9 +600,9 @@ Examples:
 	}
 
 	fmt.Println()
-	fmt.Println("=== coomerfans crawler ===")
+	fmt.Println("=== coomerfans video-downloader ===")
 	fmt.Printf("Version:      %s\n", version)
-	fmt.Printf("Creator:      %s\n", creatorURL)
+	fmt.Printf("Creator URL:  %s\n", creatorURL)
 	fmt.Printf("Output dir:   %s\n", outputDir)
 	fmt.Printf("Concurrency:  %d\n", maxDownloads)
 	fmt.Println()
@@ -612,7 +616,7 @@ Examples:
 	postLinks := collectPostLinks(creatorURL)
 	fmt.Printf("  -> %d posts found\n\n", len(postLinks))
 
-	fmt.Printf("Step 2: scraping + downloading (max %d concurrent downloads)...\n\n", maxDownloads)
+	fmt.Printf("Step 2: reading + downloading (max %d concurrent downloads)...\n\n", maxDownloads)
 
 	type queueItem struct {
 		url     string
@@ -673,7 +677,7 @@ Examples:
 	for i, postURL := range postLinks {
 		inWait.Store(false)
 		mu.Lock()
-		fmt.Printf("\n  "+bold+colDefault+"[%d/%d]"+reset+" scraping %s\n", i+1, len(postLinks), postURL)
+		fmt.Printf("\n  "+bold+colDefault+"[%d/%d]"+reset+" reading %s\n", i+1, len(postLinks), postURL)
 		mu.Unlock()
 
 		result := extractVideos(postURL)
@@ -714,7 +718,7 @@ Examples:
 				default:
 					inWait.Store(true)
 					mu.Lock()
-					fmt.Printf("\r  "+tag(colYellow, "wait")+" download queue full, be patient with the servers... %s", spinner[spinIdx%4])
+					fmt.Printf("\r  "+tag(colYellow, "wait")+" download queue full, be patient... %s", spinner[spinIdx%4])
 					mu.Unlock()
 					spinIdx++
 					time.Sleep(100 * time.Millisecond)
@@ -729,13 +733,13 @@ Examples:
 	}
 
 	fmt.Println()
-	fmt.Println("All posts scraped - waiting for the last downloads to finish...")
+	fmt.Println("All posts received - waiting for the last downloads to finish...")
 	close(queue)
 	wg.Wait()
 
 	fmt.Println()
 	fmt.Println("=== Done ===")
-	fmt.Printf("Posts scraped:     %d\n", len(postLinks))
+	fmt.Printf("Posts received:    %d\n", len(postLinks))
 	fmt.Printf("Videos found:      %d\n", totalVideos)
 	fmt.Printf("Videos downloaded: %d\n", stats.downloaded.Load())
 }
