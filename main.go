@@ -395,11 +395,13 @@ func (s dlStats) format() string {
 		s.queued(), s.active.Load(), s.downloaded.Load())
 }
 
-func (s dlStats) summary(elapsed time.Duration) string {
-	mb := float64(s.totalBytes.Load()) / 1024 / 1024
-	mbps := mb / elapsed.Seconds()
-	return fmt.Sprintf("[status] active: %d, done: %d, %.1f MB total @ %.1f MB/s",
-		s.active.Load(), s.downloaded.Load(), mb, mbps)
+// summary uses a sliding window: intervalBytes/intervalSecs = speed over last tick period
+func (s dlStats) summary(intervalBytes int64, intervalSecs float64) string {
+	totalMB := float64(s.totalBytes.Load()) / 1024 / 1024
+	intervalMB := float64(intervalBytes) / 1024 / 1024
+	mbps := intervalMB / intervalSecs
+	return fmt.Sprintf("active: %d, done: %d, %.1f MB total @ %.1f MB/s",
+		s.active.Load(), s.downloaded.Load(), totalMB, mbps)
 }
 
 func buildDownloadRequest(rawURL string) (*http.Request, error) {
@@ -490,7 +492,13 @@ func downloadVideo(rawURL, title, postURL string, index int, outputDir string, s
 		}
 
 		stats.downloaded.Add(1)
-		stats.totalBytes.Add(resp.Size())
+		// Use actual file size on disk – resp.Size() only counts bytes transferred
+		// in this session, missing already-downloaded bytes from a previous partial run
+		if fi, err := os.Stat(dest); err == nil {
+			stats.totalBytes.Add(fi.Size())
+		} else {
+			stats.totalBytes.Add(resp.Size())
+		}
 		mu.Lock()
 		fmt.Printf("\n  "+tag(colGreen, "done")+" %s (%.1f MB) %s\n",
 			filename, float64(resp.Size())/1024/1024, stats.format())
@@ -525,6 +533,27 @@ func main() {
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "--help", "-h":
+			fmt.Printf(`coomerfans-crawler %s – download videos from coomerfans.com creator pages
+
+Usage:
+  coomerfans [creator_url] [options]
+
+Arguments:
+  creator_url            Creator page URL (prompted if omitted)
+                         e.g. https://coomerfans.com/u/onlyfans/1234567/hotbabe96
+
+Options:
+  -o, --output-dir DIR   Directory for downloaded videos (default: ./downloads)
+  -c, --concurrency N    Number of parallel downloads (default: 8)
+  -v, --version          Print version and exit
+  -h, --help             Show this help
+
+Examples:
+  coomerfans https://coomerfans.com/u/onlyfans/1234567/hotbabe96
+  coomerfans https://coomerfans.com/u/onlyfans/1234567/hotbabe96 -o ~/Videos -c 4
+`, version)
+			os.Exit(0)
 		case "--version", "-v":
 			fmt.Println(version)
 			os.Exit(0)
@@ -549,6 +578,9 @@ func main() {
 	queueMax = maxDownloads + maxDownloads/2
 
 	if creatorURL == "" {
+		fmt.Printf("coomerfans-crawler %s – download videos from coomerfans.com\n", version)
+		fmt.Println("Run with --help for usage information.")
+		fmt.Println()
 		creatorURL = prompt("Enter creator URL (e.g. https://coomerfans.com/u/onlyfans/1234567/hotbabe96): ")
 	}
 	if creatorURL == "" {
@@ -611,15 +643,26 @@ func main() {
 		}()
 	}
 
-	// Background status ticker
+	// Background status ticker – only fires when scraper is blocked waiting for downloads.
+	// Uses a sliding window for MB/s (speed over last 60s interval, not since start).
+	var inWait atomic.Bool
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
-		start := time.Now()
+		var lastBytes int64
+		lastTick := time.Now()
 		for range ticker.C {
-			mu.Lock()
-			fmt.Printf("\n  "+tag(colCyan, "status")+" %s\n", stats.summary(time.Since(start)))
-			mu.Unlock()
+			if inWait.Load() {
+				now := time.Now()
+				currentBytes := stats.totalBytes.Load()
+				intervalBytes := currentBytes - lastBytes
+				intervalSecs := now.Sub(lastTick).Seconds()
+				lastBytes = currentBytes
+				lastTick = now
+				mu.Lock()
+				fmt.Printf("\n  "+tag(colCyan, "status")+" %s\n", stats.summary(intervalBytes, intervalSecs))
+				mu.Unlock()
+			}
 		}
 	}()
 
@@ -628,6 +671,7 @@ func main() {
 
 	// Scrape + enqueue
 	for i, postURL := range postLinks {
+		inWait.Store(false)
 		mu.Lock()
 		fmt.Printf("\n  "+bold+colDefault+"[%d/%d]"+reset+" scraping %s\n", i+1, len(postLinks), postURL)
 		mu.Unlock()
@@ -654,7 +698,7 @@ func main() {
 			dest := filepath.Join(outputDir, filenameFor(item.title, item.url, item.index))
 			if _, err := os.Stat(dest); err == nil {
 				mu.Lock()
-				fmt.Printf("\n  "+tag(colTeal, "skip")+" %s (already exists)\n", item.title)
+				fmt.Printf("\n  "+tag(colTeal, "skip")+" (already exists) %s\n", item.title)
 				mu.Unlock()
 				continue
 			}
@@ -668,8 +712,9 @@ func main() {
 					mu.Unlock()
 					goto nextVideo
 				default:
+					inWait.Store(true)
 					mu.Lock()
-					fmt.Printf("\r  "+tag(colYellow, "wait")+" queue full, be patient... %s", spinner[spinIdx%4])
+					fmt.Printf("\r  "+tag(colYellow, "wait")+" download queue full, be patient with the servers... %s", spinner[spinIdx%4])
 					mu.Unlock()
 					spinIdx++
 					time.Sleep(100 * time.Millisecond)
