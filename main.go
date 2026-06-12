@@ -22,6 +22,12 @@ import (
 
 var version = "dev" // overridden at build time via -ldflags "-X main.version=x.y.z"
 
+// config holds values parsed from CLI args and interactive prompts.
+type config struct {
+	creatorURL string
+	outputDir  string
+}
+
 // ANSI color/style codes
 const (
 	reset      = "\033[0m"
@@ -230,6 +236,90 @@ func extractTitle(doc *html.Node) string {
 		}
 	}
 	return strings.TrimSpace(prefixRe.ReplaceAllString(raw, ""))
+}
+
+// ── Creator URL resolution ────────────────────────────────────────────────────
+
+func isURL(input string) bool {
+	return strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://")
+}
+
+func creatorNameFromURL(url string) string {
+	parts := strings.Split(strings.TrimRight(url, "/"), "/")
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[len(parts)-1]
+}
+
+func resolveCreatorURL(creatorName string) (string, error) {
+	searchURL := "https://coomerfans.com/?q=" + url.QueryEscape(creatorName)
+	body, err := fetch(searchURL)
+	if err != nil {
+		return "", err
+	}
+
+	doc, err := html.Parse(strings.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("could not parse search results")
+	}
+
+	// Walk the tree manually so we can scope the search to the results section.
+	// The results are in a <section> with <h2>Names of Models - <name>. Total N</h2>.
+	var creatorURL string
+	var foundHeader bool
+
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if creatorURL != "" {
+			return
+		}
+		if n.Type == html.ElementNode {
+			if n.Data == "h2" && !foundHeader {
+				text := textContent(n)
+				if !strings.HasPrefix(text, "Names of Models - ") {
+					return
+				}
+				// Parse "Total N" to check there are actual results
+				re := regexp.MustCompile(`Total\s+(\d+)`)
+				if m := re.FindStringSubmatch(text); m != nil {
+					var total int
+					fmt.Sscanf(m[1], "%d", &total)
+					if total == 0 {
+						return // no results — skip this section
+					}
+				}
+				foundHeader = true
+			}
+			if foundHeader && n.Data == "section" {
+				// We've left the results section — stop walking.
+				return
+			}
+			if foundHeader && n.Data == "div" && attr(n, "class") == "thumb" {
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					if creatorURL != "" {
+						return
+					}
+					if c.Type == html.ElementNode && c.Data == "a" {
+						href := attr(c, "href")
+						if strings.HasPrefix(href, "/u/") {
+							creatorURL = absURL(searchURL, href)
+						}
+					}
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+
+	walk(doc)
+
+	if creatorURL == "" {
+		return "", fmt.Errorf("no creator found for %q (try entering the full URL)", creatorName)
+	}
+	return creatorURL, nil
 }
 
 // ── Video extraction ──────────────────────────────────────────────────────────
@@ -516,20 +606,11 @@ func prompt(label string) string {
 	return strings.TrimSpace(line)
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Input ─────────────────────────────────────────────────────────────────────
 
-func main() {
-	// On Windows, keep terminal open after finish
-	if runtime.GOOS == "windows" {
-		defer func() {
-			fmt.Print("\nPress Enter to exit...")
-			bufio.NewReader(os.Stdin).ReadString('\n')
-		}()
-	}
-
+func parseArgs() *config {
 	var creatorURL, outputDir string
 
-	// Parse CLI args
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -540,8 +621,11 @@ Usage:
   coomerfans [creator_url] [options]
 
 Arguments:
-  creator_url            Creator page URL (prompted if omitted)
+  creator_name_or_url    Creator page URL, or just the creator name.
+                         When a name is given, the site search is used
+                         to resolve the full URL.
                          e.g. https://coomerfans.com/u/onlyfans/1234567/hotbabe96
+                         or simply: hotbabe96
 
 Options:
   -o, --output-dir DIR   Directory for downloaded videos (default: ./downloads)
@@ -550,8 +634,9 @@ Options:
   -h, --help             Show this help
 
 Examples:
+  coomerfans hotbabe96
   coomerfans https://coomerfans.com/u/onlyfans/1234567/hotbabe96
-  coomerfans https://coomerfans.com/u/onlyfans/1234567/hotbabe96 -o ~/Videos -c 4
+  coomerfans hotbabe96 -o ~/Videos -c 4
 `, version)
 			os.Exit(0)
 		case "--version", "-v":
@@ -569,49 +654,101 @@ Examples:
 			}
 		default:
 			if !strings.HasPrefix(args[i], "-") {
-				creatorURL = args[i]
+				if isURL(args[i]) {
+					creatorURL = args[i]
+				} else {
+					resolved, err := resolveCreatorURL(args[i])
+					if err != nil {
+						fmt.Printf("  "+tag(colRed, "error")+" %v\n", err)
+						os.Exit(1)
+					}
+					creatorURL = resolved
+				}
 			}
 		}
 	}
 
-	// Recalculate queueMax after potential -c override
 	queueMax = maxDownloads + maxDownloads/2
+	return &config{creatorURL: creatorURL, outputDir: outputDir}
+}
 
-	if creatorURL == "" {
-		fmt.Printf("coomerfans-video-downloader %s – download videos from coomerfans.com\n", version)
-		fmt.Println("Run with --help for usage information.")
-		fmt.Println()
-		if maxDownloads > 20 {
-			fmt.Printf("\033[1;31mWarning: concurrency set to %d, which may cause server overload. This is bad for everyone. Consider using a lower value.\033[0m\n\n", maxDownloads)
-		}
-
-		creatorURL = prompt("Enter creator URL (e.g. https://coomerfans.com/u/onlyfans/1234567/hotbabe96): ")
+func resolveInteractive() (string, string) {
+	fmt.Printf("coomerfans-video-downloader %s – download videos from coomerfans.com\n", version)
+	fmt.Println("Run with --help for usage information.")
+	fmt.Println()
+	if maxDownloads > 20 {
+		fmt.Printf("\033[1;31mWarning: concurrency set to %d, which may cause server overload. This is bad for everyone. Consider using a lower value.\033[0m\n\n", maxDownloads)
 	}
+
+	creatorURL := prompt("Enter creator name or URL (e.g. slikd or https://coomerfans.com/u/onlyfans/1234567/hotbabe96): ")
 	if creatorURL == "" {
 		fmt.Println("No URL given, exiting.")
-		return
+		os.Exit(1)
+	}
+	if !isURL(creatorURL) {
+		resolved, err := resolveCreatorURL(creatorURL)
+		if err != nil {
+			fmt.Printf("  "+tag(colRed, "error")+" %v\n", err)
+			os.Exit(1)
+		}
+		creatorURL = resolved
 	}
 
+	name := creatorNameFromURL(creatorURL)
+	if name == "" {
+		name = "unknown"
+	}
+	outputDir := prompt(fmt.Sprintf("Download folder [./downloads/%s]: ", name))
 	if outputDir == "" {
-		outputDir = prompt("Download folder [./downloads]: ")
-		if outputDir == "" {
-			outputDir = "./downloads"
+		outputDir = filepath.Join("./downloads", name)
+	}
+	return creatorURL, outputDir
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+func main() {
+	if runtime.GOOS == "windows" {
+		defer func() {
+			fmt.Print("\nPress Enter to exit...")
+			bufio.NewReader(os.Stdin).ReadString('\n')
+		}()
+	}
+
+	cfg := parseArgs()
+	if cfg.creatorURL == "" {
+		cfg.creatorURL, cfg.outputDir = resolveInteractive()
+	}
+
+	if cfg.outputDir == "" {
+		name := creatorNameFromURL(cfg.creatorURL)
+		if name == "" {
+			name = "unknown"
 		}
+		cfg.outputDir = filepath.Join("./downloads", name)
 	}
 
 	fmt.Println()
 	fmt.Println("=== coomerfans video-downloader ===")
 	fmt.Printf("Version:      %s\n", version)
-	fmt.Printf("Creator URL:  %s\n", creatorURL)
-	fmt.Printf("Output dir:   %s\n", outputDir)
+	fmt.Printf("Creator URL:  %s\n", cfg.creatorURL)
+	creatorName := creatorNameFromURL(cfg.creatorURL)
+	if creatorName != "" {
+		fmt.Printf("Creator name: %s\n", creatorName)
+	}
+	fmt.Printf("Output dir:   %s\n", cfg.outputDir)
 	fmt.Printf("Concurrency:  %d\n", maxDownloads)
 	fmt.Println()
 
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
+	if err := os.MkdirAll(cfg.outputDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create output dir: %v\n", err)
 		return
 	}
 
+	runScrapeAndDownload(cfg.creatorURL, cfg.outputDir)
+}
+
+func runScrapeAndDownload(creatorURL, outputDir string) {
 	fmt.Println("Step 1: collecting post links...")
 	postLinks := collectPostLinks(creatorURL)
 	fmt.Printf("  -> %d posts found\n\n", len(postLinks))
@@ -635,7 +772,6 @@ Examples:
 	}
 	var totalVideos int
 
-	// Spin up download workers
 	var wg sync.WaitGroup
 	for range maxDownloads {
 		wg.Add(1)
@@ -647,8 +783,7 @@ Examples:
 		}()
 	}
 
-	// Background status ticker – only fires when scraper is blocked waiting for downloads.
-	// Uses a sliding window for MB/s (speed over last 60s interval, not since start).
+	// Background status ticker
 	var inWait atomic.Bool
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -673,7 +808,6 @@ Examples:
 	spinner := []string{"|", "/", "-", `\`}
 	spinIdx := 0
 
-	// Scrape + enqueue
 	for i, postURL := range postLinks {
 		inWait.Store(false)
 		mu.Lock()
@@ -698,7 +832,6 @@ Examples:
 			}
 			item := queueItem{url: u, title: itemTitle, postURL: postURL, index: totalVideos}
 
-			// Skip early if file already exists
 			dest := filepath.Join(outputDir, filenameFor(item.title, item.url, item.index))
 			if _, err := os.Stat(dest); err == nil {
 				mu.Lock()
@@ -707,7 +840,6 @@ Examples:
 				continue
 			}
 
-			// Non-blocking send; if full, spin until a slot opens
 			for {
 				select {
 				case queue <- item:
@@ -743,3 +875,4 @@ Examples:
 	fmt.Printf("Videos found:      %d\n", totalVideos)
 	fmt.Printf("Videos downloaded: %d\n", stats.downloaded.Load())
 }
+
