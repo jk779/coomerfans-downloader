@@ -24,8 +24,10 @@ var version = "dev" // overridden at build time via -ldflags "-X main.version=x.
 
 // config holds values parsed from CLI args and interactive prompts.
 type config struct {
-	creatorURL string
-	outputDir  string
+	creatorURL     string
+	outputDir      string
+	sanitizeEmojis bool
+	filenameLength int
 }
 
 // ANSI color/style codes
@@ -85,6 +87,85 @@ var (
 			ResponseHeaderTimeout: 60 * time.Second,
 		},
 	}
+)
+
+	// commonEmojis maps frequently seen emojis to word replacements.
+	var commonEmojis = map[string]string{
+		"🔥": "fire", "😈": "smilingdevil", "😛": "tongue", "🍌": "banana",
+		"🎥": "camera", "😋": "yum", "🥵": "hot", "😍": "hearteyes",
+		"❤️": "heart", "💕": "twohearts", "💋": "kiss", "👅": "tongue2",
+		"🍑": "peach", "💦": "sweatdroplets", "✨": "sparkles", "🎵": "note",
+		"💪": "muscle", "😏": "smirk", "👀": "eyes", "🐻": "bear",
+		"🐰": "rabbit", "🦋": "butterfly", "🌸": "blossom", "☀️": "sunny",
+		"🌙": "moon", "⭐": "star", "💀": "skull", "🤤": "drooling",
+		"😘": "blowkiss", "🫦": "bitinglip", "🍒": "cherry", "🫣": "peeking",
+		"😳": "flushed", "🤭": "handmouth", "😩": "tired", "🥺": "pleading",
+		"💅": "nailpolish", "🧚": "fairy", "🎀": "ribbon", "👑": "crown",
+		"💖": "sparklingheart", "💗": "growingheart", "💝": "giftheart",
+		"🔞": "18", "⚡": "lightning", "🎶": "notes", "🎤": "microphone",
+		"🎧": "headphone", "📸": "cameraflash", "👙": "bikini",
+		"🎬": "clapper", "🌟": "glowingstar", "💫": "dizzy",
+		"🎈": "balloon", "🎉": "party", "🎊": "confetti", "🎁": "gift",
+		"🏆": "trophy", "🥇": "medal", "👍": "thumbsup", "👎": "thumbsdown",
+		"👏": "clap", "🙌": "raisinghands", "🤝": "handshake",
+		"💃": "dancer", "🕺": "dancer2", "📝": "memo", "📌": "pushpin",
+		"📎": "paperclip", "✂️": "scissors", "🔒": "locked", "🔓": "unlocked",
+		"🔑": "key", "💎": "gem", "📱": "phone", "💻": "laptop",
+		"📹": "cam", "🎙️": "mic", "🎭": "masks", "🎨": "palette",
+		"📚": "books", "📖": "openbook", "📰": "newspaper", "📛": "badge",
+		"🔰": "japan", "⭕": "o", "✅": "check", "❌": "cross",
+		"❓": "question", "❗": "exclaim", "💯": "hundred",
+		"🔴": "redcircle", "🟢": "greencircle", "🔵": "bluecircle",
+		"🔺": "redtriangle", "🔻": "bluetriangle",
+		"🏁": "checkered", "🚩": "triangular", "🎌": "crossedflags",
+		"🏳️": "whitflag", "🏴": "blackflag", "🏳️‍🌈": "rainbow",
+	}
+
+	// replaceEmojis replaces known emojis with word equivalents.
+	// Unmapped multi-byte emoji sequences become [emoji].
+	func replaceEmojis(title string) string {
+		var sb strings.Builder
+		runes := []rune(title)
+		for i := 0; i < len(runes); {
+			if word, ok := commonEmojis[string(runes[i])]; ok {
+				sb.WriteString(word)
+				i++
+				continue
+			}
+			found := false
+			for end := i + 2; end <= len(runes); end++ {
+				s := string(runes[i:end])
+				if word, ok := commonEmojis[s]; ok {
+					sb.WriteString(word)
+					i = end
+					found = true
+					break
+				}
+			}
+			if !found {
+				sb.WriteRune(runes[i])
+				i++
+			}
+		}
+		return sb.String()
+	}
+
+	// truncateTitle truncates title to maxLen runes.
+	func truncateTitle(title string, maxLen int) string {
+		if maxLen <= 0 || len([]rune(title)) <= maxLen {
+			return title
+		}
+		runes := []rune(title)[:maxLen]
+		for len(runes) > 0 && runes[len(runes)-1] == ' ' {
+			runes = runes[:len(runes)-1]
+		}
+		return string(runes)
+	}
+
+// Package-level flags set by parseArgs for use by sanitizeTitle.
+var (
+	sanitizeEmojisFlag  bool
+	filenameLengthFlag int
 )
 
 func applyHeaders(req *http.Request) {
@@ -218,11 +299,13 @@ func sanitizeTitle(title string) string {
 	title = illegalRe.ReplaceAllString(title, "")
 	title = multiSpaceRe.ReplaceAllString(title, " ")
 	title = strings.TrimSpace(title)
-	runes := []rune(title)
-	if len(runes) > titleMaxLength {
-		runes = runes[:titleMaxLength]
+	if sanitizeEmojisFlag {
+		title = replaceEmojis(title)
 	}
-	return strings.TrimSpace(string(runes))
+	if filenameLengthFlag > 0 {
+		title = truncateTitle(title, filenameLengthFlag-len(".mp4"))
+	}
+	return title
 }
 
 func extractTitle(doc *html.Node) string {
@@ -470,6 +553,12 @@ func filenameFor(title, rawURL string, index int) string {
 	if base == "" {
 		base = fmt.Sprintf("video_%d", index)
 	}
+	if filenameLengthFlag > 0 {
+		avail := filenameLengthFlag - len(ext)
+		if avail > 0 && len([]rune(base)) > avail {
+			base = string([]rune(base)[:avail])
+		}
+	}
 	return base + ext
 }
 
@@ -612,6 +701,7 @@ func prompt(label string) string {
 // ── Input ─────────────────────────────────────────────────────────────────────
 
 func parseArgs() *config {
+	cfg := &config{}
 	var creatorURL, outputDir string
 
 	args := os.Args[1:]
@@ -634,6 +724,10 @@ Options:
   -o, --output-dir DIR   Directory for downloaded videos
                          (default: ./downloads/\<creator name\>/)
   -c, --concurrency N    Number of parallel downloads (default: 8)
+      --sanitize-filenames Replace emojis in filenames with words
+                           (unmapped emojis become [emoji])
+      --filename-length N  Maximum filename length including extension
+                         (default: unlimited)
   -v, --version          Print version and exit
   -h, --help             Show this help
 
@@ -656,6 +750,13 @@ Examples:
 				fmt.Sscanf(args[i+1], "%d", &maxDownloads)
 				i++
 			}
+		case "--sanitize-filenames":
+			cfg.sanitizeEmojis = true
+		case "--filename-length":
+			if i+1 < len(args) {
+				fmt.Sscanf(args[i+1], "%d", &cfg.filenameLength)
+				i++
+			}
 		default:
 			if !strings.HasPrefix(args[i], "-") {
 				if isURL(args[i]) {
@@ -673,7 +774,9 @@ Examples:
 	}
 
 	queueMax = maxDownloads + maxDownloads/2
-	return &config{creatorURL: creatorURL, outputDir: outputDir}
+	cfg.creatorURL = creatorURL
+	cfg.outputDir = outputDir
+	return cfg
 }
 
 func resolveInteractive() (string, string) {
