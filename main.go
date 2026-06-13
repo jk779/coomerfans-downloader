@@ -536,26 +536,29 @@ func downloadVideo(rawURL, title, postURL string, index int, outputDir string, s
 	grabClient := grab.NewClient()
 	grabClient.HTTPClient = downloadClient
 
-	// errorf prints a consistent error block with file context and bytes downloaded so far
-	errorf := func(soFar int64, format string, args ...any) {
-		mu.Lock()
-		fmt.Printf("\n  "+tag(colRed, "error")+" "+format+" %s\n  -> title: %q\n  -> post:  %s\n  -> video: %s\n  -> downloaded so far: %.1f MB\n",
-			append(args, stats.format(), title, postURL, rawURL, float64(soFar)/1024/1024)...)
-		mu.Unlock()
-	}
+		// errorf prints a concise error line followed by file context for debugging.
+		errorf := func(soFar int64, reason string) {
+			mu.Lock()
+			fmt.Printf("\n  "+tag(colRed, "error")+" %s\n", stats.format())
+			fmt.Printf("  download of video %q failed because %s\n", title, reason)
+			fmt.Printf("  -> post:  %s\n", postURL)
+			fmt.Printf("  -> video: %s\n", rawURL)
+			fmt.Printf("  -> downloaded so far: %.1f MB\n", float64(soFar)/1024/1024)
+			mu.Unlock()
+		}
 
 	retries := 0
 	for {
 		req, err := grab.NewRequest(dest, rawURL)
 		if err != nil {
-			errorf(0, "%v", err)
+			errorf(0, err.Error())
 			return
 		}
 
 		// Apply correct headers via a pre-built http.Request
 		httpReq, err := buildDownloadRequest(rawURL)
 		if err != nil {
-			errorf(0, "%v", err)
+			errorf(0, err.Error())
 			return
 		}
 		req.HTTPRequest.Header = httpReq.Header
@@ -565,7 +568,7 @@ func downloadVideo(rawURL, title, postURL string, index int, outputDir string, s
 			soFar := resp.BytesComplete()
 			if resp.HTTPResponse != nil && resp.HTTPResponse.StatusCode == 429 {
 				if retries >= 10 {
-					errorf(soFar, "gave up after 10 retries for %q", title)
+					errorf(soFar, fmt.Sprintf("gave up after 10 retries for %q", title))
 					return
 				}
 				retries++
@@ -577,7 +580,7 @@ func downloadVideo(rawURL, title, postURL string, index int, outputDir string, s
 				time.Sleep(wait)
 				continue
 			}
-			errorf(soFar, "%v", err)
+			errorf(soFar, err.Error())
 			return
 		}
 
@@ -618,17 +621,18 @@ func parseArgs() *config {
 			fmt.Printf(`coomerfans-video-downloader %s – download videos from coomerfans.com creator pages
 
 Usage:
-  coomerfans [creator_url] [options]
+  coomerfans [creator_name_or_url] [options]
 
 Arguments:
-  creator_name_or_url    Creator page URL, or just the creator name.
-                         When a name is given, the site search is used
-                         to resolve the full URL.
+  creator_name_or_url    Creator name or URL.  When a name is given,
+                         the site search is used to resolve the full
+                         URL.
                          e.g. https://coomerfans.com/u/onlyfans/1234567/hotbabe96
                          or simply: hotbabe96
 
 Options:
-  -o, --output-dir DIR   Directory for downloaded videos (default: ./downloads)
+  -o, --output-dir DIR   Directory for downloaded videos
+                         (default: ./downloads/\<creator name\>/)
   -c, --concurrency N    Number of parallel downloads (default: 8)
   -v, --version          Print version and exit
   -h, --help             Show this help
@@ -682,7 +686,7 @@ func resolveInteractive() (string, string) {
 
 	creatorURL := prompt("Enter creator name or URL (e.g. slikd or https://coomerfans.com/u/onlyfans/1234567/hotbabe96): ")
 	if creatorURL == "" {
-		fmt.Println("No URL given, exiting.")
+		fmt.Println("No input given, exiting.")
 		os.Exit(1)
 	}
 	if !isURL(creatorURL) {
@@ -729,7 +733,7 @@ func main() {
 	}
 
 	fmt.Println()
-	fmt.Println("=== coomerfans video-downloader ===")
+	fmt.Println("=== coomerfans-video-downloader ===")
 	fmt.Printf("Version:      %s\n", version)
 	fmt.Printf("Creator URL:  %s\n", cfg.creatorURL)
 	creatorName := creatorNameFromURL(cfg.creatorURL)
