@@ -43,14 +43,3 @@ jobs:
           prerelease: false
           files: ${{ steps.assets.outputs.files }}
           overwrite_files: true
-          body: |
-            ## Unverified Downloads
-
-            These binaries are **not code-signed**, so you may see warnings from your OS.
-
-            **macOS** — If Gatekeeper blocks the binary, run:
-            ```
-            xattr -d com.apple.quarantine ./coomerfans-downloader-darwin-arm64
-            ```
-
-            **Windows** — If SmartScreen blocks the executable, click "More info" → "Run anyway".

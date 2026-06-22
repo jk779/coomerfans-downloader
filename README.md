@@ -6,6 +6,17 @@ Download videos from coomerfans.com creator pages.
 
 Pre-built binaries are available on the [releases page](https://github.com/jk779/coomerfans-downloader/releases).
 
+### Unverified Downloads
+
+These binaries are **not code-signed**, so you may see warnings from your OS.
+
+**macOS** — If Gatekeeper blocks the binary, run:
+```
+xattr -d com.apple.quarantine ./coomerfans-downloader-darwin-arm64
+```
+
+**Windows** — If SmartScreen blocks the executable, click "More info" → "Run anyway".
+
 ## Usage
 
 ```
