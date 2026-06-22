@@ -24,10 +24,8 @@ var version = "dev" // overridden at build time via -ldflags "-X main.version=x.
 
 // config holds values parsed from CLI args and interactive prompts.
 type config struct {
-	creatorURL     string
-	outputDir      string
-	sanitizeEmojis bool
-	filenameLength int
+	creatorURL string
+	outputDir  string
 }
 
 // ANSI color/style codes
@@ -47,8 +45,7 @@ func tag(color, label string) string {
 }
 
 const (
-	scrapeDelay    = 1500 * time.Millisecond
-	titleMaxLength = 200
+	scrapeDelay = 1500 * time.Millisecond
 )
 
 var (
@@ -61,7 +58,8 @@ var (
 	pageNumRe    = regexp.MustCompile(`[?&]page=(\d+)`)
 	prefixRe     = regexp.MustCompile(`(?i)^[^/\-]+[/\-]\s*`)
 	illegalRe    = regexp.MustCompile(`[/\\:*?"<>|]`)
-	multiSpaceRe = regexp.MustCompile(`\s+`)
+	multiSpaceRe    = regexp.MustCompile(`\s+`)
+	totalRe         = regexp.MustCompile(`Total\s+(\d+)`)
 
 	httpHeaders = map[string]string{
 		"User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -89,64 +87,64 @@ var (
 	}
 )
 
-	// commonEmojis maps frequently seen emojis to word replacements.
-	var commonEmojis = map[string]string{
-		"🔥": "fire", "😈": "smilingdevil", "😛": "tongue", "🍌": "banana",
-		"🎥": "camera", "😋": "yum", "🥵": "hot", "😍": "hearteyes",
-		"❤️": "heart", "💕": "twohearts", "💋": "kiss", "👅": "tongue2",
-		"🍑": "peach", "💦": "sweatdroplets", "✨": "sparkles", "🎵": "note",
-		"💪": "muscle", "😏": "smirk", "👀": "eyes", "🐻": "bear",
-		"🐰": "rabbit", "🦋": "butterfly", "🌸": "blossom", "☀️": "sunny",
-		"🌙": "moon", "⭐": "star", "💀": "skull", "🤤": "drooling",
-		"😘": "blowkiss", "🫦": "bitinglip", "🍒": "cherry", "🫣": "peeking",
-		"😳": "flushed", "🤭": "handmouth", "😩": "tired", "🥺": "pleading",
-		"💅": "nailpolish", "🧚": "fairy", "🎀": "ribbon", "👑": "crown",
-		"💖": "sparklingheart", "💗": "growingheart", "💝": "giftheart",
-		"🔞": "18", "⚡": "lightning", "🎶": "notes", "🎤": "microphone",
-		"🎧": "headphone", "📸": "cameraflash", "👙": "bikini",
-		"🎬": "clapper", "🌟": "glowingstar", "💫": "dizzy",
-		"🎈": "balloon", "🎉": "party", "🎊": "confetti", "🎁": "gift",
-		"🏆": "trophy", "🥇": "medal", "👍": "thumbsup", "👎": "thumbsdown",
-		"👏": "clap", "🙌": "raisinghands", "🤝": "handshake",
-		"💃": "dancer", "🕺": "dancer2", "📝": "memo", "📌": "pushpin",
-		"📎": "paperclip", "✂️": "scissors", "🔒": "locked", "🔓": "unlocked",
-		"🔑": "key", "💎": "gem", "📱": "phone", "💻": "laptop",
-		"📹": "cam", "🎙️": "mic", "🎭": "masks", "🎨": "palette",
-		"📚": "books", "📖": "openbook", "📰": "newspaper", "📛": "badge",
-		"🔰": "japan", "⭕": "o", "✅": "check", "❌": "cross",
-		"❓": "question", "❗": "exclaim", "💯": "hundred",
-		"🔴": "redcircle", "🟢": "greencircle", "🔵": "bluecircle",
-		"🔺": "redtriangle", "🔻": "bluetriangle",
-		"🏁": "checkered", "🚩": "triangular", "🎌": "crossedflags",
-		"🏳️": "whitflag", "🏴": "blackflag", "🏳️‍🌈": "rainbow",
-	}
+// commonEmojis maps frequently seen emojis to word replacements.
+var commonEmojis = map[string]string{
+	"🔥": "fire", "😈": "smilingdevil", "😛": "tongue", "🍌": "banana",
+	"🎥": "camera", "😋": "yum", "🥵": "hot", "😍": "hearteyes",
+	"❤️": "heart", "💕": "twohearts", "💋": "kiss", "👅": "tongue2",
+	"🍑": "peach", "💦": "sweatdroplets", "✨": "sparkles", "🎵": "note",
+	"💪": "muscle", "😏": "smirk", "👀": "eyes", "🐻": "bear",
+	"🐰": "rabbit", "🦋": "butterfly", "🌸": "blossom", "☀️": "sunny",
+	"🌙": "moon", "⭐": "star", "💀": "skull", "🤤": "drooling",
+	"😘": "blowkiss", "🫦": "bitinglip", "🍒": "cherry", "🫣": "peeking",
+	"😳": "flushed", "🤭": "handmouth", "😩": "tired", "🥺": "pleading",
+	"💅": "nailpolish", "🧚": "fairy", "🎀": "ribbon", "👑": "crown",
+	"💖": "sparklingheart", "💗": "growingheart", "💝": "giftheart",
+	"🔞": "18", "⚡": "lightning", "🎶": "notes", "🎤": "microphone",
+	"🎧": "headphone", "📸": "cameraflash", "👙": "bikini",
+	"🎬": "clapper", "🌟": "glowingstar", "💫": "dizzy",
+	"🎈": "balloon", "🎉": "party", "🎊": "confetti", "🎁": "gift",
+	"🏆": "trophy", "🥇": "medal", "👍": "thumbsup", "👎": "thumbsdown",
+	"👏": "clap", "🙌": "raisinghands", "🤝": "handshake",
+	"💃": "dancer", "🕺": "dancer2", "📝": "memo", "📌": "pushpin",
+	"📎": "paperclip", "✂️": "scissors", "🔒": "locked", "🔓": "unlocked",
+	"🔑": "key", "💎": "gem", "📱": "phone", "💻": "laptop",
+	"📹": "cam", "🎙️": "mic", "🎭": "masks", "🎨": "palette",
+	"📚": "books", "📖": "openbook", "📰": "newspaper", "📛": "badge",
+	"🔰": "japan", "⭕": "o", "✅": "check", "❌": "cross",
+	"❓": "question", "❗": "exclaim", "💯": "hundred",
+	"🔴": "redcircle", "🟢": "greencircle", "🔵": "bluecircle",
+	"🔺": "redtriangle", "🔻": "bluetriangle",
+	"🏁": "checkered", "🚩": "triangular", "🎌": "crossedflags",
+	"🏳️": "whitflag", "🏴": "blackflag", "🏳️‍🌈": "rainbow",
+}
 
-	// replaceEmojis replaces known emojis with word equivalents.
-	// Unmapped multi-byte emoji sequences become [emoji].
-	func replaceEmojis(title string) string {
-		var sb strings.Builder
-		runes := []rune(title)
-		for i := 0; i < len(runes); {
-			if word, ok := commonEmojis[string(runes[i])]; ok {
+// replaceEmojis replaces known emojis with word equivalents.
+// Unmapped multi-byte emoji sequences become [emoji].
+func replaceEmojis(title string) string {
+	var sb strings.Builder
+	runes := []rune(title)
+	for i := 0; i < len(runes); {
+		if word, ok := commonEmojis[string(runes[i])]; ok {
+			sb.WriteString(word)
+			i++
+			continue
+		}
+		found := false
+		for end := i + 2; end <= len(runes); end++ {
+			s := string(runes[i:end])
+			if word, ok := commonEmojis[s]; ok {
 				sb.WriteString(word)
-				i++
-				continue
-			}
-			found := false
-			for end := i + 2; end <= len(runes); end++ {
-				s := string(runes[i:end])
-				if word, ok := commonEmojis[s]; ok {
-					sb.WriteString(word)
-					i = end
-					found = true
-					break
-				}
-			}
-			if !found {
-				sb.WriteRune(runes[i])
-				i++
+				i = end
+				found = true
+				break
 			}
 		}
+		if !found {
+			sb.WriteRune(runes[i])
+			i++
+		}
+	}
 		return sb.String()
 	}
 
@@ -291,7 +289,7 @@ func metaContent(doc *html.Node, attrKey, attrVal string) string {
 
 // ── Title extraction ──────────────────────────────────────────────────────────
 
-func sanitizeTitle(title string) string {
+func sanitizeTitle(title string, doReplaceEmojis bool, maxLen int) string {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return "untitled"
@@ -299,11 +297,11 @@ func sanitizeTitle(title string) string {
 	title = illegalRe.ReplaceAllString(title, "")
 	title = multiSpaceRe.ReplaceAllString(title, " ")
 	title = strings.TrimSpace(title)
-	if sanitizeEmojisFlag {
+	if doReplaceEmojis {
 		title = replaceEmojis(title)
 	}
-	if filenameLengthFlag > 0 {
-		title = truncateTitle(title, filenameLengthFlag-len(".mp4"))
+	if maxLen > 0 {
+		title = truncateTitle(title, maxLen-len(".mp4"))
 	}
 	return title
 }
@@ -364,8 +362,7 @@ func resolveCreatorURL(creatorName string) (string, error) {
 					return
 				}
 				// Parse "Total N" to check there are actual results
-				re := regexp.MustCompile(`Total\s+(\d+)`)
-				if m := re.FindStringSubmatch(text); m != nil {
+				if m := totalRe.FindStringSubmatch(text); m != nil {
 					var total int
 					fmt.Sscanf(m[1], "%d", &total)
 					if total == 0 {
@@ -424,7 +421,7 @@ func extractVideos(postURL string) postResult {
 		return postResult{}
 	}
 
-	title := sanitizeTitle(extractTitle(doc))
+	title := sanitizeTitle(extractTitle(doc), sanitizeEmojisFlag, filenameLengthFlag)
 	seen := map[string]bool{}
 	var videos []string
 
@@ -519,11 +516,11 @@ func collectPostLinks(creatorURL string) []string {
 			if m := pageNumRe.FindStringSubmatch(pageURL); m != nil {
 				fmt.Sscanf(m[1], "%d", &curPage)
 			}
-			nextPageRe := regexp.MustCompile(fmt.Sprintf(`[?&]page=%d(&|$)`, curPage+1))
+			nextPageRe := fmt.Sprintf(`[?&]page=%d(&|$)`, curPage+1)
 			findAll(doc, "a", func(n *html.Node) {
 				if nextLink == "" {
 					href := attr(n, "href")
-					if nextPageRe.MatchString(href) {
+					if matched, _ := regexp.MatchString(nextPageRe, href); matched {
 						nextLink = href
 					}
 				}
@@ -542,7 +539,7 @@ func collectPostLinks(creatorURL string) []string {
 
 // ── Downloader ────────────────────────────────────────────────────────────────
 
-func filenameFor(title, rawURL string, index int) string {
+func filenameFor(title, rawURL string, index int, maxLen int) string {
 	ext := ".mp4"
 	if u, err := url.Parse(rawURL); err == nil {
 		if e := filepath.Ext(u.Path); e != "" {
@@ -553,8 +550,8 @@ func filenameFor(title, rawURL string, index int) string {
 	if base == "" {
 		base = fmt.Sprintf("video_%d", index)
 	}
-	if filenameLengthFlag > 0 {
-		avail := filenameLengthFlag - len(ext)
+	if maxLen > 0 {
+		avail := maxLen - len(ext)
 		if avail > 0 && len([]rune(base)) > avail {
 			base = string([]rune(base)[:avail])
 		}
@@ -722,9 +719,9 @@ Arguments:
 
 Options:
   -o, --output-dir DIR   Directory for downloaded videos
-                         (default: ./downloads/\<creator name\>/)
+                         (default: ./downloads/creator-name/)
   -c, --concurrency N    Number of parallel downloads (default: 8)
-      --sanitize-filenames Replace emojis in filenames with words
+      --replace-emojis     Replace emojis in filenames with words
                            (unmapped emojis become [emoji])
       --filename-length N  Maximum filename length including extension
                          (default: unlimited)
@@ -751,10 +748,10 @@ Examples:
 				i++
 			}
 		case "--sanitize-filenames":
-			cfg.sanitizeEmojis = true
+			sanitizeEmojisFlag = true
 		case "--filename-length":
 			if i+1 < len(args) {
-				fmt.Sscanf(args[i+1], "%d", &cfg.filenameLength)
+				fmt.Sscanf(args[i+1], "%d", &filenameLengthFlag)
 				i++
 			}
 		default:
@@ -939,7 +936,7 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 			}
 			item := queueItem{url: u, title: itemTitle, postURL: postURL, index: totalVideos}
 
-			dest := filepath.Join(outputDir, filenameFor(item.title, item.url, item.index))
+			dest := filepath.Join(outputDir, filenameFor(item.title, item.url, item.index, filenameLengthFlag))
 			if _, err := os.Stat(dest); err == nil {
 				mu.Lock()
 				fmt.Printf("\n  "+tag(colTeal, "skip")+" (already exists) %s\n", item.title)
