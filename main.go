@@ -616,7 +616,7 @@ func downloadVideo(rawURL, title, postURL string, index int, outputDir string, s
 	stats.active.Add(1)
 	defer stats.active.Add(-1)
 
-	filename := filenameFor(title, rawURL, index)
+	filename := filenameFor(title, rawURL, index, filenameLengthFlag)
 	dest := filepath.Join(outputDir, filename)
 
 	grabClient := grab.NewClient()
@@ -711,27 +711,32 @@ Usage:
   coomerfans [creator_name_or_url] [options]
 
 Arguments:
-  creator_name_or_url    Creator name or URL.  When a name is given,
-                         the site search is used to resolve the full
-                         URL.
-                         e.g. https://coomerfans.com/u/onlyfans/1234567/hotbabe96
-                         or simply: hotbabe96
+  creator_name_or_url     Creator name or URL.  When a name is given,
+                            the site search is used to resolve the full URL.
+                            e.g. https://coomerfans.com/u/onlyfans/1234567/hotbabe96
+                            or simply: hotbabe96
 
 Options:
   -o, --output-dir DIR   Directory for downloaded videos
-                         (default: ./downloads/creator-name/)
+                           (default: ./downloads/creator-name/)
   -c, --concurrency N    Number of parallel downloads (default: 8)
-      --replace-emojis     Replace emojis in filenames with words
+  --replace-emojis       Replace emojis in filenames with words
                            (unmapped emojis become [emoji])
-      --filename-length N  Maximum filename length including extension
-                         (default: unlimited)
+  --filename-length N    Maximum filename length including extension
+                           (default: unlimited)
   -v, --version          Print version and exit
   -h, --help             Show this help
+
+Filename cleanup:
+  Illegal characters ([\/\\:*?"<>|]) are removed.
+  Multiple spaces are collapsed and leading/trailing spaces are trimmed.
 
 Examples:
   coomerfans hotbabe96
   coomerfans https://coomerfans.com/u/onlyfans/1234567/hotbabe96
-  coomerfans hotbabe96 -o ~/Videos -c 4
+  coomerfans hotbabe96 -o ~/Videos/hotbabe86 -c 4
+  coomerfans hotbabe96 -o ~/Videos/hotbabe86 -c 12 --replace-emojis --filename-length 64
+ 
 `, version)
 			os.Exit(0)
 		case "--version", "-v":
