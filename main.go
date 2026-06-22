@@ -705,10 +705,10 @@ func parseArgs() *config {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--help", "-h":
-			fmt.Printf(`coomerfans-video-downloader %s – download videos from coomerfans.com creator pages
+			fmt.Printf(`coomerfans-downloader %s – download videos from coomerfans.com creator pages
 
 Usage:
-  coomerfans [creator_name_or_url] [options]
+  coomerfans-downloader [creator_name_or_url] [options]
 
 Arguments:
   creator_name_or_url     Creator name or URL.  When a name is given,
@@ -782,7 +782,7 @@ Examples:
 }
 
 func resolveInteractive() (string, string) {
-	fmt.Printf("coomerfans-video-downloader %s – download videos from coomerfans.com\n", version)
+	fmt.Printf("coomerfans-downloader %s – download videos from coomerfans.com\n", version)
 	fmt.Println("Run with --help for usage information.")
 	fmt.Println()
 	if maxDownloads > 20 {
@@ -838,7 +838,7 @@ func main() {
 	}
 
 	fmt.Println()
-	fmt.Println("=== coomerfans-video-downloader ===")
+	fmt.Println("=== coomerfans-downloader ===")
 	fmt.Printf("Version:      %s\n", version)
 	fmt.Printf("Creator URL:  %s\n", cfg.creatorURL)
 	creatorName := creatorNameFromURL(cfg.creatorURL)

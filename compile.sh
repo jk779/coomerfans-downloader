@@ -14,7 +14,7 @@ set -euo pipefail
 # Valid GOARCH values: amd64, arm64, 386, arm, ...
 # Format: GOOS/GOARCH  e.g. darwin/arm64, windows/amd64
 
-BINARY_NAME="coomerfans"
+BINARY_NAME="coomerfans-downloader"
 OUT_DIR="./dist"
 VERSION="1.0.0"
 
