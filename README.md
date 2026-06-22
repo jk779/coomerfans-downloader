@@ -8,14 +8,14 @@ Pre-built binaries are available on the [releases page](https://github.com/jk779
 
 ### Unverified Downloads
 
-These binaries are **not code-signed**, so you may see warnings from your OS.
+These binaries are **not code-signed**, but are built and released by a Github Action. You will see warnings from your OS when first opening them.
 
-**macOS** — If Gatekeeper blocks the binary, run:
+**macOS**: Gatekeeper will block the binary. Run this command to disable Gatekeeper for this file.
 ```
-xattr -d com.apple.quarantine ./coomerfans-downloader-darwin-arm64
+xattr -d com.apple.quarantine ~/Downloads/coomerfans-downloader-darwin-arm64
 ```
 
-**Windows** — If SmartScreen blocks the executable, click "More info" → "Run anyway".
+**Windows**: If SmartScreen blocks the executable, click "More info" → "Run anyway".
 
 ## Usage
 
