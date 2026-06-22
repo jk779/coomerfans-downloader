@@ -42,4 +42,4 @@ jobs:
           draft: false
           prerelease: false
           files: ${{ steps.assets.outputs.files }}
-          overwrite: true
+          overwrite_files: true
