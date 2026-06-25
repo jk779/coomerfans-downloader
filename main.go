@@ -32,7 +32,7 @@ type config struct {
 const (
 	reset      = "\033[0m"
 	bold       = "\033[1m"
-	colCyan    = "\033[36m"      // enqueued
+	colCyan    = "\033[36m"      // downloading
 	colGreen   = "\033[32m"      // done (green-yellow)
 	colTeal    = "\033[38;5;28m" // skip (darker green)
 	colYellow  = "\033[33m"      // wait
@@ -50,7 +50,6 @@ const (
 
 var (
 	maxDownloads = 8
-	queueMax     = maxDownloads + maxDownloads/2
 
 	videoExt     = regexp.MustCompile(`(?i)\.(mp4|m3u8|webm|mov)`)
 	scriptURLRe  = regexp.MustCompile(`(?i)https?://[^\s"'<>]+\.(?:mp4|m3u8|webm|mov)[^\s"'<>]*`)
@@ -563,12 +562,12 @@ type dlStats struct {
 	downloaded *atomic.Int64
 	active     *atomic.Int64
 	totalBytes *atomic.Int64
-	queued     func() int // returns current queue length
+	failed     *atomic.Int64
 }
 
 func (s dlStats) format() string {
-	return fmt.Sprintf("[queued: %d, active: %d, done: %d]",
-		s.queued(), s.active.Load(), s.downloaded.Load())
+	return fmt.Sprintf("[active: %d, done: %d]",
+		s.active.Load(), s.downloaded.Load())
 }
 
 // summary uses a sliding window: intervalBytes/intervalSecs = speed over last tick period
@@ -576,8 +575,8 @@ func (s dlStats) summary(intervalBytes int64, intervalSecs float64) string {
 	totalMB := float64(s.totalBytes.Load()) / 1024 / 1024
 	intervalMB := float64(intervalBytes) / 1024 / 1024
 	mbps := intervalMB / intervalSecs
-	return fmt.Sprintf("active: %d, done: %d, %.1f MB total @ %.1f MB/s",
-		s.active.Load(), s.downloaded.Load(), totalMB, mbps)
+	return fmt.Sprintf("active: %d, done: %d, failed: %d, %.1f MB total @ %.1f MB/s",
+		s.active.Load(), s.downloaded.Load(), s.failed.Load(), totalMB, mbps)
 }
 
 func buildDownloadRequest(rawURL string) (*http.Request, error) {
@@ -625,6 +624,7 @@ func downloadVideo(rawURL, title, postURL string, index int, outputDir string, s
 		// errorf prints a concise error line followed by file context for debugging.
 		errorf := func(soFar int64, reason string) {
 			mu.Lock()
+			stats.failed.Add(1)
 			fmt.Printf("\n  "+tag(colRed, "error")+" %s\n", stats.format())
 			fmt.Printf("  download of video %q failed because %s\n", title, reason)
 			fmt.Printf("  -> post:  %s\n", postURL)
@@ -775,7 +775,6 @@ Examples:
 		}
 	}
 
-	queueMax = maxDownloads + maxDownloads/2
 	cfg.creatorURL = creatorURL
 	cfg.outputDir = outputDir
 	return cfg
@@ -864,61 +863,16 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 
 	fmt.Printf("Step 2: reading + downloading (max %d concurrent downloads)...\n\n", maxDownloads)
 
-	type queueItem struct {
-		url     string
-		title   string
-		postURL string
-		index   int
-	}
-	queue := make(chan queueItem, queueMax)
-
 	var mu sync.Mutex
 	stats := dlStats{
 		downloaded: &atomic.Int64{},
 		active:     &atomic.Int64{},
 		totalBytes: &atomic.Int64{},
-		queued:     func() int { return len(queue) },
+		failed:     &atomic.Int64{},
 	}
 	var totalVideos int
 
-	var wg sync.WaitGroup
-	for range maxDownloads {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for item := range queue {
-				downloadVideo(item.url, item.title, item.postURL, item.index, outputDir, stats, &mu)
-			}
-		}()
-	}
-
-	// Background status ticker
-	var inWait atomic.Bool
-	go func() {
-		ticker := time.NewTicker(60 * time.Second)
-		defer ticker.Stop()
-		var lastBytes int64
-		lastTick := time.Now()
-		for range ticker.C {
-			if inWait.Load() {
-				now := time.Now()
-				currentBytes := stats.totalBytes.Load()
-				intervalBytes := currentBytes - lastBytes
-				intervalSecs := now.Sub(lastTick).Seconds()
-				lastBytes = currentBytes
-				lastTick = now
-				mu.Lock()
-				fmt.Printf("\n  "+tag(colCyan, "status")+" %s\n", stats.summary(intervalBytes, intervalSecs))
-				mu.Unlock()
-			}
-		}
-	}()
-
-	spinner := []string{"|", "/", "-", `\`}
-	spinIdx := 0
-
 	for i, postURL := range postLinks {
-		inWait.Store(false)
 		mu.Lock()
 		fmt.Printf("\n  "+bold+colDefault+"[%d/%d]"+reset+" reading %s\n", i+1, len(postLinks), postURL)
 		mu.Unlock()
@@ -939,33 +893,28 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 			if len(result.videos) > 1 {
 				itemTitle = fmt.Sprintf("%s (%d)", result.title, vi+1)
 			}
-			item := queueItem{url: u, title: itemTitle, postURL: postURL, index: totalVideos}
 
-			dest := filepath.Join(outputDir, filenameFor(item.title, item.url, item.index, filenameLengthFlag))
+			dest := filepath.Join(outputDir, filenameFor(itemTitle, u, totalVideos, filenameLengthFlag))
 			if _, err := os.Stat(dest); err == nil {
 				mu.Lock()
-				fmt.Printf("\n  "+tag(colTeal, "skip")+" (already exists) %s\n", item.title)
+				fmt.Printf("\n  "+tag(colTeal, "skip")+" (already exists) %s\n", itemTitle)
 				mu.Unlock()
 				continue
 			}
 
-			for {
-				select {
-				case queue <- item:
-					mu.Lock()
-					fmt.Printf("\n  "+tag(colCyan, "enqueued")+" %s %s\n", item.title, stats.format())
-					mu.Unlock()
-					goto nextVideo
-				default:
-					inWait.Store(true)
-					mu.Lock()
-					fmt.Printf("\r  "+tag(colYellow, "wait")+" download queue full, be patient... %s", spinner[spinIdx%4])
-					mu.Unlock()
-					spinIdx++
-					time.Sleep(100 * time.Millisecond)
-				}
+			// Spawn download goroutine immediately - no queuing!
+			go func() {
+				mu.Lock()
+				fmt.Printf("\n  "+tag(colCyan, "downloading")+" %s %s\n", itemTitle, stats.format())
+				mu.Unlock()
+
+				downloadVideo(u, itemTitle, postURL, totalVideos, outputDir, stats, &mu)
+			}()
+
+			// Wait for a slot to become available (limit concurrency to maxDownloads)
+			for stats.active.Load() >= int64(maxDownloads) {
+				time.Sleep(100 * time.Millisecond)
 			}
-		nextVideo:
 		}
 
 		if i < len(postLinks)-1 {
@@ -975,7 +924,16 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 
 	fmt.Println()
 	fmt.Println("All posts received - waiting for the last downloads to finish...")
-	close(queue)
+
+	// Wait for all downloads to complete
+	var wg sync.WaitGroup
+	for range maxDownloads {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(2 * time.Second) // Give downloads time to finish
+		}()
+	}
 	wg.Wait()
 
 	fmt.Println()
@@ -983,5 +941,6 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 	fmt.Printf("Posts received:    %d\n", len(postLinks))
 	fmt.Printf("Videos found:      %d\n", totalVideos)
 	fmt.Printf("Videos downloaded: %d\n", stats.downloaded.Load())
+	fmt.Printf("Videos failed:     %d\n", stats.failed.Load())
 }
 
