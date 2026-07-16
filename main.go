@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/cavaliergopher/grab/v3"
 
@@ -54,11 +55,11 @@ var (
 	videoExt     = regexp.MustCompile(`(?i)\.(mp4|m3u8|webm|mov)`)
 	scriptURLRe  = regexp.MustCompile(`(?i)https?://[^\s"'<>]+\.(?:mp4|m3u8|webm|mov)[^\s"'<>]*`)
 	postPathRe   = regexp.MustCompile(`^/p/\d+/`)
+	postIDRe     = regexp.MustCompile(`^\d+$`)
 	pageNumRe    = regexp.MustCompile(`[?&]page=(\d+)`)
 	prefixRe     = regexp.MustCompile(`(?i)^[^/\-]+[/\-]\s*`)
-	illegalRe    = regexp.MustCompile(`[/\\:*?"<>|]`)
-	multiSpaceRe    = regexp.MustCompile(`\s+`)
-	totalRe         = regexp.MustCompile(`Total\s+(\d+)`)
+	multiSpaceRe = regexp.MustCompile(`\s+`)
+	totalRe      = regexp.MustCompile(`Total\s+(\d+)`)
 
 	httpHeaders = map[string]string{
 		"User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -86,83 +87,37 @@ var (
 	}
 )
 
-// commonEmojis maps frequently seen emojis to word replacements.
-var commonEmojis = map[string]string{
-	"🔥": "fire", "😈": "smilingdevil", "😛": "tongue", "🍌": "banana",
-	"🎥": "camera", "😋": "yum", "🥵": "hot", "😍": "hearteyes",
-	"❤️": "heart", "💕": "twohearts", "💋": "kiss", "👅": "tongue2",
-	"🍑": "peach", "💦": "sweatdroplets", "✨": "sparkles", "🎵": "note",
-	"💪": "muscle", "😏": "smirk", "👀": "eyes", "🐻": "bear",
-	"🐰": "rabbit", "🦋": "butterfly", "🌸": "blossom", "☀️": "sunny",
-	"🌙": "moon", "⭐": "star", "💀": "skull", "🤤": "drooling",
-	"😘": "blowkiss", "🫦": "bitinglip", "🍒": "cherry", "🫣": "peeking",
-	"😳": "flushed", "🤭": "handmouth", "😩": "tired", "🥺": "pleading",
-	"💅": "nailpolish", "🧚": "fairy", "🎀": "ribbon", "👑": "crown",
-	"💖": "sparklingheart", "💗": "growingheart", "💝": "giftheart",
-	"🔞": "18", "⚡": "lightning", "🎶": "notes", "🎤": "microphone",
-	"🎧": "headphone", "📸": "cameraflash", "👙": "bikini",
-	"🎬": "clapper", "🌟": "glowingstar", "💫": "dizzy",
-	"🎈": "balloon", "🎉": "party", "🎊": "confetti", "🎁": "gift",
-	"🏆": "trophy", "🥇": "medal", "👍": "thumbsup", "👎": "thumbsdown",
-	"👏": "clap", "🙌": "raisinghands", "🤝": "handshake",
-	"💃": "dancer", "🕺": "dancer2", "📝": "memo", "📌": "pushpin",
-	"📎": "paperclip", "✂️": "scissors", "🔒": "locked", "🔓": "unlocked",
-	"🔑": "key", "💎": "gem", "📱": "phone", "💻": "laptop",
-	"📹": "cam", "🎙️": "mic", "🎭": "masks", "🎨": "palette",
-	"📚": "books", "📖": "openbook", "📰": "newspaper", "📛": "badge",
-	"🔰": "japan", "⭕": "o", "✅": "check", "❌": "cross",
-	"❓": "question", "❗": "exclaim", "💯": "hundred",
-	"🔴": "redcircle", "🟢": "greencircle", "🔵": "bluecircle",
-	"🔺": "redtriangle", "🔻": "bluetriangle",
-	"🏁": "checkered", "🚩": "triangular", "🎌": "crossedflags",
-	"🏳️": "whitflag", "🏴": "blackflag", "🏳️‍🌈": "rainbow",
+// filterFilenameCharacters retains only ordinary, filesystem-safe title characters.
+func filterFilenameCharacters(title string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return r
+		}
+		switch r {
+		case ' ', '-', '_', '.', '(', ')', '[', ']':
+			return r
+		}
+		if unicode.IsSpace(r) {
+			return ' '
+		}
+		return -1
+	}, title)
 }
 
-// replaceEmojis replaces known emojis with word equivalents.
-// Unmapped multi-byte emoji sequences become [emoji].
-func replaceEmojis(title string) string {
-	var sb strings.Builder
-	runes := []rune(title)
-	for i := 0; i < len(runes); {
-		if word, ok := commonEmojis[string(runes[i])]; ok {
-			sb.WriteString(word)
-			i++
-			continue
-		}
-		found := false
-		for end := i + 2; end <= len(runes); end++ {
-			s := string(runes[i:end])
-			if word, ok := commonEmojis[s]; ok {
-				sb.WriteString(word)
-				i = end
-				found = true
-				break
-			}
-		}
-		if !found {
-			sb.WriteRune(runes[i])
-			i++
-		}
+// truncateTitle truncates title to maxLen runes.
+func truncateTitle(title string, maxLen int) string {
+	if maxLen <= 0 || len([]rune(title)) <= maxLen {
+		return title
 	}
-		return sb.String()
+	runes := []rune(title)[:maxLen]
+	for len(runes) > 0 && runes[len(runes)-1] == ' ' {
+		runes = runes[:len(runes)-1]
 	}
+	return string(runes)
+}
 
-	// truncateTitle truncates title to maxLen runes.
-	func truncateTitle(title string, maxLen int) string {
-		if maxLen <= 0 || len([]rune(title)) <= maxLen {
-			return title
-		}
-		runes := []rune(title)[:maxLen]
-		for len(runes) > 0 && runes[len(runes)-1] == ' ' {
-			runes = runes[:len(runes)-1]
-		}
-		return string(runes)
-	}
-
-// Package-level flags set by parseArgs for use by sanitizeTitle.
 var (
-	sanitizeEmojisFlag  bool
-	filenameLengthFlag int
+	filenameLengthFlag = 100
 )
 
 func applyHeaders(req *http.Request) {
@@ -288,19 +243,16 @@ func metaContent(doc *html.Node, attrKey, attrVal string) string {
 
 // ── Title extraction ──────────────────────────────────────────────────────────
 
-func sanitizeTitle(title string, doReplaceEmojis bool, maxLen int) string {
+func sanitizeTitle(title string) string {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return "untitled"
 	}
-	title = illegalRe.ReplaceAllString(title, "")
+	title = filterFilenameCharacters(title)
 	title = multiSpaceRe.ReplaceAllString(title, " ")
 	title = strings.TrimSpace(title)
-	if doReplaceEmojis {
-		title = replaceEmojis(title)
-	}
-	if maxLen > 0 {
-		title = truncateTitle(title, maxLen-len(".mp4"))
+	if title == "" {
+		return "untitled"
 	}
 	return title
 }
@@ -420,7 +372,7 @@ func extractVideos(postURL string) postResult {
 		return postResult{}
 	}
 
-	title := sanitizeTitle(extractTitle(doc), sanitizeEmojisFlag, filenameLengthFlag)
+	title := sanitizeTitle(extractTitle(doc))
 	seen := map[string]bool{}
 	var videos []string
 
@@ -538,7 +490,19 @@ func collectPostLinks(creatorURL string) []string {
 
 // ── Downloader ────────────────────────────────────────────────────────────────
 
-func filenameFor(title, rawURL string, index int, maxLen int) string {
+func postIDFromURL(postURL string) string {
+	parsed, err := url.Parse(postURL)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	if len(parts) >= 2 && parts[0] == "p" && postIDRe.MatchString(parts[1]) {
+		return parts[1]
+	}
+	return ""
+}
+
+func filenameFor(title, rawURL, postID string, index, maxLen int) string {
 	ext := ".mp4"
 	if u, err := url.Parse(rawURL); err == nil {
 		if e := filepath.Ext(u.Path); e != "" {
@@ -549,13 +513,40 @@ func filenameFor(title, rawURL string, index int, maxLen int) string {
 	if base == "" {
 		base = fmt.Sprintf("video_%d", index)
 	}
+	suffix := ext
+	if postID != "" {
+		suffix = " - " + postID + ext
+	}
 	if maxLen > 0 {
-		avail := maxLen - len(ext)
+		avail := maxLen - len(suffix)
 		if avail > 0 && len([]rune(base)) > avail {
-			base = string([]rune(base)[:avail])
+			base = truncateTitle(base, avail)
 		}
 	}
-	return base + ext
+	return base + suffix
+}
+
+// postAlreadyDownloaded deliberately identifies a completed post by its ID,
+// regardless of title changes between runs.
+func postAlreadyDownloaded(outputDir, postID string) bool {
+	if postID == "" {
+		return false
+	}
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		ext := filepath.Ext(name)
+		if ext != "" && strings.HasSuffix(strings.TrimSuffix(name, ext), " - "+postID) {
+			return true
+		}
+	}
+	return false
 }
 
 type dlStats struct {
@@ -615,23 +606,23 @@ func downloadVideo(rawURL, title, postURL string, index int, outputDir string, s
 	stats.active.Add(1)
 	defer stats.active.Add(-1)
 
-	filename := filenameFor(title, rawURL, index, filenameLengthFlag)
+	filename := filenameFor(title, rawURL, postIDFromURL(postURL), index, filenameLengthFlag)
 	dest := filepath.Join(outputDir, filename)
 
 	grabClient := grab.NewClient()
 	grabClient.HTTPClient = downloadClient
 
-		// errorf prints a concise error line followed by file context for debugging.
-		errorf := func(soFar int64, reason string) {
-			mu.Lock()
-			stats.failed.Add(1)
-			fmt.Printf("\n  "+tag(colRed, "error")+" %s\n", stats.format())
-			fmt.Printf("  download of video %q failed because %s\n", title, reason)
-			fmt.Printf("  -> post:  %s\n", postURL)
-			fmt.Printf("  -> video: %s\n", rawURL)
-			fmt.Printf("  -> downloaded so far: %.1f MB\n", float64(soFar)/1024/1024)
-			mu.Unlock()
-		}
+	// errorf prints a concise error line followed by file context for debugging.
+	errorf := func(soFar int64, reason string) {
+		mu.Lock()
+		stats.failed.Add(1)
+		fmt.Printf("\n  "+tag(colRed, "error")+" %s\n", stats.format())
+		fmt.Printf("  download of video %q failed because %s\n", title, reason)
+		fmt.Printf("  -> post:  %s\n", postURL)
+		fmt.Printf("  -> video: %s\n", rawURL)
+		fmt.Printf("  -> downloaded so far: %.1f MB\n", float64(soFar)/1024/1024)
+		mu.Unlock()
+	}
 
 	retries := 0
 	for {
@@ -720,22 +711,21 @@ Options:
   -o, --output-dir DIR   Directory for downloaded videos
                            (default: ./downloads/creator-name/)
   -c, --concurrency N    Number of parallel downloads (default: 8)
-  --replace-emojis       Replace emojis in filenames with words
-                           (unmapped emojis become [emoji])
   --filename-length N    Maximum filename length including extension
-                           (default: unlimited)
+                           (default: 100)
   -v, --version          Print version and exit
   -h, --help             Show this help
 
 Filename cleanup:
-  Illegal characters ([\/\\:*?"<>|]) are removed.
+  Only letters, digits, spaces, and -_.()[] are retained.
   Multiple spaces are collapsed and leading/trailing spaces are trimmed.
+  Each filename ends with " - POST_ID" before its extension.
 
 Examples:
   coomerfans hotbabe96
   coomerfans https://coomerfans.com/u/onlyfans/1234567/hotbabe96
   coomerfans hotbabe96 -o ~/Videos/hotbabe86 -c 4
-  coomerfans hotbabe96 -o ~/Videos/hotbabe86 -c 12 --replace-emojis --filename-length 64
+  coomerfans hotbabe96 -o ~/Videos/hotbabe86 -c 12 --filename-length 64
  
 `, version)
 			os.Exit(0)
@@ -752,8 +742,6 @@ Examples:
 				fmt.Sscanf(args[i+1], "%d", &maxDownloads)
 				i++
 			}
-		case "--sanitize-filenames":
-			sanitizeEmojisFlag = true
 		case "--filename-length":
 			if i+1 < len(args) {
 				fmt.Sscanf(args[i+1], "%d", &filenameLengthFlag)
@@ -887,19 +875,19 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 		}
 		mu.Unlock()
 
+		postID := postIDFromURL(postURL)
+		if postAlreadyDownloaded(outputDir, postID) {
+			mu.Lock()
+			fmt.Printf("\n  "+tag(colTeal, "skip")+" (post ID already exists) %s\n", result.title)
+			mu.Unlock()
+			continue
+		}
+
 		for vi, u := range result.videos {
 			totalVideos++
 			itemTitle := result.title
 			if len(result.videos) > 1 {
 				itemTitle = fmt.Sprintf("%s (%d)", result.title, vi+1)
-			}
-
-			dest := filepath.Join(outputDir, filenameFor(itemTitle, u, totalVideos, filenameLengthFlag))
-			if _, err := os.Stat(dest); err == nil {
-				mu.Lock()
-				fmt.Printf("\n  "+tag(colTeal, "skip")+" (already exists) %s\n", itemTitle)
-				mu.Unlock()
-				continue
 			}
 
 			// Spawn download goroutine immediately - no queuing!
@@ -943,4 +931,3 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 	fmt.Printf("Videos downloaded: %d\n", stats.downloaded.Load())
 	fmt.Printf("Videos failed:     %d\n", stats.failed.Load())
 }
-

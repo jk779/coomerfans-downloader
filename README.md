@@ -37,11 +37,10 @@ coomerfans-downloader hotbabe96 -o ~/Videos -c 4
 |------|-------------|
 | `-o, --output-dir DIR` | Download directory (default: `./downloads/creator-name/`) |
 | `-c, --concurrency N` | Parallel downloads (default: 8) |
-| `--replace-emojis` | Replace emojis in filenames with words |
-| `--filename-length N` | Maximum filename length including extension |
+| `--filename-length N` | Maximum filename length including extension (default: 100) |
 | `-v, --version` | Print version |
 | `-h, --help` | Show help |
 
 ## Filename cleanup
 
-Illegal characters are removed, spaces are normalized, and emojis are replaced with word equivalents. Use `--replace-emojis` to enable emoji replacement and `--filename-length` to limit filename size.
+Only letters, digits, spaces, and `-_.()[]` are retained; all other title characters are removed and spaces are normalized. Each filename ends with ` - POST_ID` before its extension (for example, `This is the title - 12345678.mp4`). Existing downloads are identified by this post ID. Use `--filename-length` to override the 100-character filename limit.
