@@ -26,7 +26,10 @@ func TestSanitizeTitleOnlyRetainsWhitelistedCharacters(t *testing.T) {
 }
 
 func TestFilenameIncludesPostIDAndRespectsLimit(t *testing.T) {
-	got := filenameFor(strings.Repeat("a", 120), "https://example.com/video.mp4", "12345678", 1, 100)
+	got := filenameFor("creator-name", strings.Repeat("a", 120), "https://example.com/video.mp4", "12345678", 1, 100)
+	if !strings.HasPrefix(got, "creator-name - ") {
+		t.Fatalf("filename %q does not start with creator name", got)
+	}
 	if !strings.HasSuffix(got, " - 12345678.mp4") {
 		t.Fatalf("filename %q does not end with post ID", got)
 	}
@@ -45,5 +48,15 @@ func TestPostAlreadyDownloadedMatchesIDOnly(t *testing.T) {
 	}
 	if postAlreadyDownloaded(dir, "81544523") {
 		t.Fatal("unexpected match for a different post ID")
+	}
+}
+
+func TestPostAlreadyDownloadedIgnoresPartialFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "creator - An old title - 12345678.mp4.part"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if postAlreadyDownloaded(dir, "12345678") {
+		t.Fatal("partial file must not be treated as a completed download")
 	}
 }

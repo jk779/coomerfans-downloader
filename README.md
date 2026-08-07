@@ -17,6 +17,16 @@ xattr -d com.apple.quarantine ~/Downloads/coomerfans-downloader-darwin-arm64
 
 **Windows**: If SmartScreen blocks the executable, click "More info" → "Run anyway".
 
+## Build from source
+
+```sh
+make                     # default: macOS Apple Silicon, Linux x86-64, Windows x86-64
+make VERSION=1.2.0
+make TARGETS="darwin/arm64 windows/arm64" VERSION=1.2.0
+```
+
+Binaries are written to `dist/`. Run `make help` for the available options.
+
 ## Usage
 
 ```
@@ -35,7 +45,7 @@ coomerfans-downloader hotbabe96 -o ~/Videos -c 4
 
 | Flag | Description |
 |------|-------------|
-| `-o, --output-dir DIR` | Download directory (default: `./downloads/creator-name/`) |
+| `-o, --output-dir DIR` | Download directory (default: `./creator-name/`) |
 | `-c, --concurrency N` | Parallel downloads (default: 8) |
 | `--filename-length N` | Maximum filename length including extension (default: 100) |
 | `-v, --version` | Print version |
@@ -43,4 +53,4 @@ coomerfans-downloader hotbabe96 -o ~/Videos -c 4
 
 ## Filename cleanup
 
-Only letters, digits, spaces, and `-_.()[]` are retained; all other title characters are removed and spaces are normalized. Each filename ends with ` - POST_ID` before its extension (for example, `This is the title - 12345678.mp4`). Existing downloads are identified by this post ID. Use `--filename-length` to override the 100-character filename limit.
+Only letters, digits, spaces, and `-_.()[]` are retained; all other title characters are removed and spaces are normalized. Each filename starts with `CREATOR_NAME - ` and ends with ` - POST_ID` before its extension (for example, `creator-name - This is the title - 12345678.mp4`). Existing downloads are identified by this post ID. Interrupted downloads keep an additional `.part` suffix and are resumed on the next run; only completed files are treated as existing downloads. Use `--filename-length` to override the 100-character filename limit.

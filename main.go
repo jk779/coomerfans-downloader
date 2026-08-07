@@ -502,7 +502,7 @@ func postIDFromURL(postURL string) string {
 	return ""
 }
 
-func filenameFor(title, rawURL, postID string, index, maxLen int) string {
+func filenameFor(creatorName, title, rawURL, postID string, index, maxLen int) string {
 	ext := ".mp4"
 	if u, err := url.Parse(rawURL); err == nil {
 		if e := filepath.Ext(u.Path); e != "" {
@@ -512,6 +512,9 @@ func filenameFor(title, rawURL, postID string, index, maxLen int) string {
 	base := title
 	if base == "" {
 		base = fmt.Sprintf("video_%d", index)
+	}
+	if creatorName != "" {
+		base = sanitizeTitle(creatorName) + " - " + base
 	}
 	suffix := ext
 	if postID != "" {
@@ -541,6 +544,11 @@ func postAlreadyDownloaded(outputDir, postID string) bool {
 			continue
 		}
 		name := entry.Name()
+		// Partial files are intentionally kept as *.part so an interrupted
+		// download can be resumed on the next run without being treated as done.
+		if strings.HasSuffix(name, ".part") {
+			continue
+		}
 		ext := filepath.Ext(name)
 		if ext != "" && strings.HasSuffix(strings.TrimSuffix(name, ext), " - "+postID) {
 			return true
@@ -602,12 +610,13 @@ func buildDownloadRequest(rawURL string) (*http.Request, error) {
 	return req, nil
 }
 
-func downloadVideo(rawURL, title, postURL string, index int, outputDir string, stats dlStats, mu *sync.Mutex) {
+func downloadVideo(rawURL, title, postURL, creatorName string, index int, outputDir string, stats dlStats, mu *sync.Mutex) {
 	stats.active.Add(1)
 	defer stats.active.Add(-1)
 
-	filename := filenameFor(title, rawURL, postIDFromURL(postURL), index, filenameLengthFlag)
-	dest := filepath.Join(outputDir, filename)
+	filename := filenameFor(creatorName, title, rawURL, postIDFromURL(postURL), index, filenameLengthFlag)
+	finalDest := filepath.Join(outputDir, filename)
+	partialDest := finalDest + ".part"
 
 	grabClient := grab.NewClient()
 	grabClient.HTTPClient = downloadClient
@@ -626,7 +635,9 @@ func downloadVideo(rawURL, title, postURL string, index int, outputDir string, s
 
 	retries := 0
 	for {
-		req, err := grab.NewRequest(dest, rawURL)
+		// grab resumes an existing destination automatically. Keeping that
+		// destination as *.part prevents an interrupted file from looking done.
+		req, err := grab.NewRequest(partialDest, rawURL)
 		if err != nil {
 			errorf(0, err.Error())
 			return
@@ -661,10 +672,15 @@ func downloadVideo(rawURL, title, postURL string, index int, outputDir string, s
 			return
 		}
 
+		if err := os.Rename(partialDest, finalDest); err != nil {
+			errorf(resp.BytesComplete(), fmt.Sprintf("could not finalize download: %v", err))
+			return
+		}
+
 		stats.downloaded.Add(1)
 		// Use actual file size on disk – resp.Size() only counts bytes transferred
 		// in this session, missing already-downloaded bytes from a previous partial run
-		if fi, err := os.Stat(dest); err == nil {
+		if fi, err := os.Stat(finalDest); err == nil {
 			stats.totalBytes.Add(fi.Size())
 		} else {
 			stats.totalBytes.Add(resp.Size())
@@ -709,7 +725,7 @@ Arguments:
 
 Options:
   -o, --output-dir DIR   Directory for downloaded videos
-                           (default: ./downloads/creator-name/)
+                           (default: ./creator-name/)
   -c, --concurrency N    Number of parallel downloads (default: 8)
   --filename-length N    Maximum filename length including extension
                            (default: 100)
@@ -719,7 +735,8 @@ Options:
 Filename cleanup:
   Only letters, digits, spaces, and -_.()[] are retained.
   Multiple spaces are collapsed and leading/trailing spaces are trimmed.
-  Each filename ends with " - POST_ID" before its extension.
+  Each filename starts with "CREATOR_NAME - " and ends with " - POST_ID"
+  before its extension. Interrupted downloads use an additional .part suffix.
 
 Examples:
   coomerfans hotbabe96
@@ -794,9 +811,9 @@ func resolveInteractive() (string, string) {
 	if name == "" {
 		name = "unknown"
 	}
-	outputDir := prompt(fmt.Sprintf("Download folder [./downloads/%s]: ", name))
+	outputDir := prompt(fmt.Sprintf("Download folder [./%s]: ", name))
 	if outputDir == "" {
-		outputDir = filepath.Join("./downloads", name)
+		outputDir = filepath.Join(".", name)
 	}
 	return creatorURL, outputDir
 }
@@ -821,7 +838,7 @@ func main() {
 		if name == "" {
 			name = "unknown"
 		}
-		cfg.outputDir = filepath.Join("./downloads", name)
+		cfg.outputDir = filepath.Join(".", name)
 	}
 
 	fmt.Println()
@@ -845,6 +862,10 @@ func main() {
 }
 
 func runScrapeAndDownload(creatorURL, outputDir string) {
+	creatorName := creatorNameFromURL(creatorURL)
+	if creatorName == "" {
+		creatorName = "unknown"
+	}
 	fmt.Println("Step 1: collecting post links...")
 	postLinks := collectPostLinks(creatorURL)
 	fmt.Printf("  -> %d posts found\n\n", len(postLinks))
@@ -896,7 +917,7 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 				fmt.Printf("\n  "+tag(colCyan, "downloading")+" %s %s\n", itemTitle, stats.format())
 				mu.Unlock()
 
-				downloadVideo(u, itemTitle, postURL, totalVideos, outputDir, stats, &mu)
+				downloadVideo(u, itemTitle, postURL, creatorName, totalVideos, outputDir, stats, &mu)
 			}()
 
 			// Wait for a slot to become available (limit concurrency to maxDownloads)
