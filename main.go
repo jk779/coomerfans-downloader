@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +30,7 @@ var version = "dev" // overridden at build time via -ldflags "-X main.version=x.
 type config struct {
 	creatorURL string
 	outputDir  string
+	failedOnly bool
 }
 
 // ANSI color/style codes
@@ -566,6 +569,113 @@ type dlStats struct {
 	failed     *atomic.Int64
 }
 
+// failedDownload identifies a video by information that remains valid when a
+// signed media URL expires. videoIndex is its zero-based position on the post.
+type failedDownload struct {
+	PostURL    string `json:"post_url"`
+	VideoIndex int    `json:"video_index"`
+}
+
+// failedDownloadTracker keeps a small, per-creator retry queue next to the
+// downloaded files. All its methods are safe to call from download workers.
+type failedDownloadTracker struct {
+	mu      sync.Mutex
+	path    string
+	records map[string]failedDownload
+}
+
+func failedDownloadsPath(outputDir string) string {
+	return filepath.Join(outputDir, ".failed-downloads.json")
+}
+
+func failedDownloadKey(record failedDownload) string {
+	return fmt.Sprintf("%s#%d", record.PostURL, record.VideoIndex)
+}
+
+func loadFailedDownloadTracker(outputDir string) (*failedDownloadTracker, error) {
+	tracker := &failedDownloadTracker{
+		path:    failedDownloadsPath(outputDir),
+		records: make(map[string]failedDownload),
+	}
+	body, err := os.ReadFile(tracker.path)
+	if os.IsNotExist(err) {
+		return tracker, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var records []failedDownload
+	if err := json.Unmarshal(body, &records); err != nil {
+		return nil, fmt.Errorf("could not read failed-downloads file: %w", err)
+	}
+	for _, record := range records {
+		if record.PostURL != "" && record.VideoIndex >= 0 {
+			tracker.records[failedDownloadKey(record)] = record
+		}
+	}
+	return tracker, nil
+}
+
+func (t *failedDownloadTracker) list() []failedDownload {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	records := make([]failedDownload, 0, len(t.records))
+	for _, record := range t.records {
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].PostURL == records[j].PostURL {
+			return records[i].VideoIndex < records[j].VideoIndex
+		}
+		return records[i].PostURL < records[j].PostURL
+	})
+	return records
+}
+
+func (t *failedDownloadTracker) saveLocked() error {
+	if len(t.records) == 0 {
+		if err := os.Remove(t.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	records := make([]failedDownload, 0, len(t.records))
+	for _, record := range t.records {
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool { return failedDownloadKey(records[i]) < failedDownloadKey(records[j]) })
+	body, err := json.MarshalIndent(records, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := t.path + ".tmp"
+	if err := os.WriteFile(tmp, append(body, '\n'), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, t.path)
+}
+
+func (t *failedDownloadTracker) add(record failedDownload) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.records[failedDownloadKey(record)] = record
+	return t.saveLocked()
+}
+
+func (t *failedDownloadTracker) remove(record failedDownload) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.records, failedDownloadKey(record))
+	return t.saveLocked()
+}
+
+func (t *failedDownloadTracker) clear() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.records = make(map[string]failedDownload)
+	return t.saveLocked()
+}
+
 func (s dlStats) format() string {
 	return fmt.Sprintf("[active: %d, done: %d]",
 		s.active.Load(), s.downloaded.Load())
@@ -763,7 +873,7 @@ func buildDownloadRequest(rawURL string) (*http.Request, error) {
 	return req, nil
 }
 
-func downloadVideo(rawURL, title, postURL, creatorName string, index int, outputDir string, stats dlStats, progress *downloadProgress, reporter *statusReporter) {
+func downloadVideo(rawURL, title, postURL, creatorName string, index, videoIndex int, outputDir string, stats dlStats, progress *downloadProgress, reporter *statusReporter, failedTracker *failedDownloadTracker) {
 	stats.active.Add(1)
 	defer stats.active.Add(-1)
 
@@ -777,6 +887,9 @@ func downloadVideo(rawURL, title, postURL, creatorName string, index int, output
 	// errorf prints a concise error line followed by file context for debugging.
 	errorf := func(soFar int64, reason string) {
 		stats.failed.Add(1)
+		if err := failedTracker.add(failedDownload{PostURL: postURL, VideoIndex: videoIndex}); err != nil {
+			reporter.Printf("  "+tag(colYellow, "warn")+" could not save failed download: %v\n", err)
+		}
 		reporter.Printf("\n  "+tag(colRed, "error")+" %s\n", stats.format())
 		reporter.Printf("  download of video %q failed because %s\n", title, reason)
 		reporter.Printf("  -> post:  %s\n", postURL)
@@ -837,6 +950,9 @@ func downloadVideo(rawURL, title, postURL, creatorName string, index int, output
 		}
 
 		stats.downloaded.Add(1)
+		if err := failedTracker.remove(failedDownload{PostURL: postURL, VideoIndex: videoIndex}); err != nil {
+			reporter.Printf("  "+tag(colYellow, "warn")+" could not update failed-downloads file: %v\n", err)
+		}
 		// Use actual file size on disk – resp.Size() only counts bytes transferred
 		// in this session, missing already-downloaded bytes from a previous partial run
 		if fi, err := os.Stat(finalDest); err == nil {
@@ -886,6 +1002,7 @@ Options:
   -c, --concurrency N    Number of parallel downloads (default: 8)
   --filename-length N    Maximum filename length including extension
                            (default: 100)
+  --failed-only          Retry saved failed downloads only; do not scrape indexes
   -v, --version          Print version and exit
   -h, --help             Show this help
 
@@ -921,6 +1038,8 @@ Examples:
 				fmt.Sscanf(args[i+1], "%d", &filenameLengthFlag)
 				i++
 			}
+		case "--failed-only":
+			cfg.failedOnly = true
 		default:
 			if !strings.HasPrefix(args[i], "-") {
 				if isURL(args[i]) {
@@ -986,7 +1105,9 @@ func main() {
 	}
 
 	cfg := parseArgs()
-	if cfg.creatorURL == "" {
+	// Retrying a saved queue needs only its output directory; it deliberately
+	// avoids resolving a creator or scraping an index page.
+	if cfg.creatorURL == "" && !(cfg.failedOnly && cfg.outputDir != "") {
 		cfg.creatorURL, cfg.outputDir = resolveInteractive()
 	}
 
@@ -1015,10 +1136,40 @@ func main() {
 		return
 	}
 
-	runScrapeAndDownload(cfg.creatorURL, cfg.outputDir)
+	failedTracker, err := loadFailedDownloadTracker(cfg.outputDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load failed-downloads file: %v\n", err)
+		return
+	}
+	if cfg.failedOnly {
+		runFailedDownloads(cfg.outputDir, failedTracker)
+		return
+	}
+	if failures := failedTracker.list(); len(failures) > 0 {
+		fmt.Printf("Found %d saved failed download(s).\n", len(failures))
+		choice := prompt("[1] Retry and exit  [2] Ignore and scrape normally  [3] Delete list and exit: ")
+		switch choice {
+		case "1":
+			runFailedDownloads(cfg.outputDir, failedTracker)
+			return
+		case "3":
+			if err := failedTracker.clear(); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to delete failed-downloads file: %v\n", err)
+				return
+			}
+			fmt.Println("Failed-downloads list deleted.")
+			return
+		case "", "2":
+			// Continue. Newly failed downloads are merged into this list.
+		default:
+			fmt.Println("Unknown selection; continuing with the normal scrape.")
+		}
+	}
+
+	runScrapeAndDownload(cfg.creatorURL, cfg.outputDir, failedTracker)
 }
 
-func runScrapeAndDownload(creatorURL, outputDir string) {
+func runScrapeAndDownload(creatorURL, outputDir string, failedTracker *failedDownloadTracker) {
 	creatorName := creatorNameFromURL(creatorURL)
 	if creatorName == "" {
 		creatorName = "unknown"
@@ -1027,6 +1178,32 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 	postLinks := collectPostLinks(creatorURL)
 	fmt.Printf("  -> %d posts found\n\n", len(postLinks))
 
+	runDownloads(postLinks, creatorName, outputDir, failedTracker, nil)
+}
+
+func runFailedDownloads(outputDir string, failedTracker *failedDownloadTracker) {
+	failures := failedTracker.list()
+	if len(failures) == 0 {
+		fmt.Println("No saved failed downloads.")
+		return
+	}
+	creatorName := filepath.Base(filepath.Clean(outputDir))
+	posts := make([]string, 0, len(failures))
+	selected := make(map[string]map[int]bool)
+	for _, failure := range failures {
+		if selected[failure.PostURL] == nil {
+			selected[failure.PostURL] = make(map[int]bool)
+			posts = append(posts, failure.PostURL)
+		}
+		selected[failure.PostURL][failure.VideoIndex] = true
+	}
+	fmt.Printf("Retrying %d saved failed download(s) from %d post(s)...\n\n", len(failures), len(posts))
+	runDownloads(posts, creatorName, outputDir, failedTracker, selected)
+}
+
+// selected is nil for a normal scrape. Otherwise it limits each freshly read
+// post page to the video positions that previously failed.
+func runDownloads(postLinks []string, creatorName, outputDir string, failedTracker *failedDownloadTracker, selected map[string]map[int]bool) {
 	fmt.Printf("Step 2: reading + downloading (max %d concurrent downloads)...\n\n", maxDownloads)
 
 	var mu sync.Mutex
@@ -1060,7 +1237,7 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 		mu.Unlock()
 
 		postID := postIDFromURL(postURL)
-		if postAlreadyDownloaded(outputDir, postID) {
+		if selected == nil && postAlreadyDownloaded(outputDir, postID) {
 			mu.Lock()
 			fmt.Printf("\n  "+tag(colTeal, "skip")+" (post ID already exists) %s\n", result.title)
 			mu.Unlock()
@@ -1068,6 +1245,9 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 		}
 
 		for vi, u := range result.videos {
+			if selected != nil && !selected[postURL][vi] {
+				continue
+			}
 			totalVideos++
 			stats.found.Add(1)
 			itemIndex := totalVideos
@@ -1084,7 +1264,7 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 				defer func() { <-downloadSlots }()
 				reporter.Printf("\n  "+tag(colCyan, "downloading")+" %s %s\n", itemTitle, stats.format())
 
-				downloadVideo(u, itemTitle, postURL, creatorName, itemIndex, outputDir, stats, progress, reporter)
+				downloadVideo(u, itemTitle, postURL, creatorName, itemIndex, vi, outputDir, stats, progress, reporter, failedTracker)
 			}()
 		}
 

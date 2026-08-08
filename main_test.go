@@ -60,3 +60,39 @@ func TestPostAlreadyDownloadedIgnoresPartialFiles(t *testing.T) {
 		t.Fatal("partial file must not be treated as a completed download")
 	}
 }
+
+func TestFailedDownloadTrackerPersistsAndRemovesRecords(t *testing.T) {
+	dir := t.TempDir()
+	tracker, err := loadFailedDownloadTracker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := failedDownload{PostURL: "https://coomerfans.com/p/123/1/x", VideoIndex: 0}
+	second := failedDownload{PostURL: "https://coomerfans.com/p/123/1/x", VideoIndex: 1}
+	if err := tracker.add(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := tracker.add(second); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := loadFailedDownloadTracker(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(reloaded.list()); got != 2 {
+		t.Fatalf("saved failures = %d, want 2", got)
+	}
+	if err := reloaded.remove(first); err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.list(); len(got) != 1 || got[0] != second {
+		t.Fatalf("remaining failures = %#v, want %#v", got, []failedDownload{second})
+	}
+	if err := reloaded.clear(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(failedDownloadsPath(dir)); !os.IsNotExist(err) {
+		t.Fatalf("failure file still exists: %v", err)
+	}
+}
