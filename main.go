@@ -146,6 +146,12 @@ func rateLimitBackoff(attempt int) time.Duration {
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
 func fetch(rawURL string, retries ...int) (string, error) {
+	return fetchWithWarning(rawURL, nil, retries...)
+}
+
+// fetchWithWarning reports retryable HTTP responses to onWarning when provided.
+// This lets post scraping keep warnings on the same line format as its post.
+func fetchWithWarning(rawURL string, onWarning func(status int, wait time.Duration), retries ...int) (string, error) {
 	maxRetries := 3
 	if len(retries) > 0 {
 		maxRetries = retries[0]
@@ -179,7 +185,11 @@ func fetch(rawURL string, retries ...int) (string, error) {
 			}
 			rateLimitRetries++
 			wait := rateLimitBackoff(rateLimitRetries)
-			fmt.Printf("\n  "+tag(colRed, "429")+" scraping rate limited, waiting %ds (attempt %d/%d)...\n", int(wait.Seconds()), rateLimitRetries, maxRateLimitRetry)
+			if onWarning != nil {
+				onWarning(resp.StatusCode, wait)
+			} else {
+				fmt.Printf("\n  "+tag(colRed, "429")+" scraping rate limited, waiting %ds (attempt %d/%d)...\n", int(wait.Seconds()), rateLimitRetries, maxRateLimitRetry)
+			}
 			time.Sleep(wait)
 			attempt-- // 429 retries do not consume ordinary transient-error retries.
 			continue
@@ -187,7 +197,11 @@ func fetch(rawURL string, retries ...int) (string, error) {
 			resp.Body.Close()
 			lastStatus = resp.StatusCode
 			wait := time.Duration(attempt+1) * 5 * time.Second
-			fmt.Printf("\n  "+tag(colYellow, "warn")+" HTTP %d, retrying in %ds...\n", resp.StatusCode, int(wait.Seconds()))
+			if onWarning != nil {
+				onWarning(resp.StatusCode, wait)
+			} else {
+				fmt.Printf("\n  "+tag(colYellow, "warn")+" HTTP %d, retrying in %ds...\n", resp.StatusCode, int(wait.Seconds()))
+			}
 			time.Sleep(wait)
 		default:
 			resp.Body.Close()
@@ -387,15 +401,22 @@ func resolveCreatorURL(creatorName string) (string, error) {
 // ── Video extraction ──────────────────────────────────────────────────────────
 
 type postResult struct {
-	videos []string
-	title  string
+	videos      []string
+	title       string
+	hadWarnings bool
+	err         error
 }
 
-func extractVideos(postURL string) postResult {
-	body, err := fetch(postURL)
+func extractVideos(postURL string, onWarning func(status int, wait time.Duration)) postResult {
+	hadWarnings := false
+	body, err := fetchWithWarning(postURL, func(status int, wait time.Duration) {
+		hadWarnings = true
+		if onWarning != nil {
+			onWarning(status, wait)
+		}
+	})
 	if err != nil {
-		fmt.Printf("  "+tag(colYellow, "warn")+" fetch error for %s: %v\n", postURL, err)
-		return postResult{}
+		return postResult{hadWarnings: true, err: err}
 	}
 
 	doc, err := html.Parse(strings.NewReader(body))
@@ -433,7 +454,7 @@ func extractVideos(postURL string) postResult {
 		}
 	})
 
-	return postResult{videos: videos, title: title}
+	return postResult{videos: videos, title: title, hadWarnings: hadWarnings}
 }
 
 // ── Pagination + post link collection ────────────────────────────────────────
@@ -762,21 +783,19 @@ type statusReporter struct {
 	progress  *downloadProgress
 	maxActive int
 	outputMu  *sync.Mutex
-	header    string
 	enabled   bool
 	rows      int
 	stop      chan struct{}
 	done      chan struct{}
 }
 
-func newStatusReporter(stats dlStats, progress *downloadProgress, maxActive int, outputMu *sync.Mutex, header string) *statusReporter {
+func newStatusReporter(stats dlStats, progress *downloadProgress, maxActive int, outputMu *sync.Mutex) *statusReporter {
 	info, err := os.Stdout.Stat()
 	return &statusReporter{
 		stats:     stats,
 		progress:  progress,
 		maxActive: maxActive,
 		outputMu:  outputMu,
-		header:    header,
 		enabled:   err == nil && info.Mode()&os.ModeCharDevice != 0,
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
@@ -795,7 +814,7 @@ func (r *statusReporter) Start() {
 		return
 	}
 	rows, err := terminalRows()
-	if err != nil || rows < 4 {
+	if err != nil || rows < 2 {
 		r.enabled = false
 		close(r.done)
 		return
@@ -805,7 +824,6 @@ func (r *statusReporter) Start() {
 	// is not gradually overwritten by the scrolling log region.
 	fmt.Print("\033[2J\033[H")
 	r.setLayoutLocked(rows)
-	fmt.Printf("\033[1;1H\033[2K%s\033[2;1H\033[2K\033[3;1H", r.header)
 	r.outputMu.Unlock()
 	go r.run()
 }
@@ -831,8 +849,7 @@ func (r *statusReporter) run() {
 			seconds := now.Sub(lastTime).Seconds()
 			rate := float64(bytes-lastBytes) / seconds / 1024 / 1024
 			r.outputMu.Lock()
-			// The scroll region reserves the first row for the scrape header and the
-			// final row for progress.
+			// The scroll region reserves the final row for progress.
 			// The log cursor is restored immediately after each redraw.
 			fmt.Printf("\0337\033[%d;1H\033[2K"+tag(colCyan, "progress")+" downloading: %d/%d | completed: %d/%d | failed: %d | %.1f MB/s\0338",
 				r.rows,
@@ -849,8 +866,8 @@ func (r *statusReporter) run() {
 }
 
 func (r *statusReporter) setLayoutLocked(rows int) {
-	// Reserve the title and one empty line above the scrolling log region.
-	fmt.Printf("\033[3;%dr", rows-1)
+	// Restrict normal output to every row except the final progress row.
+	fmt.Printf("\033[1;%dr", rows-1)
 	r.rows = rows
 }
 
@@ -1208,7 +1225,7 @@ func runScrapeAndDownload(creatorURL, outputDir string, failedTracker *failedDow
 	postLinks := collectPostLinks(creatorURL)
 	fmt.Printf("  -> %d posts found\n\n", len(postLinks))
 
-	runDownloads(postLinks, creatorName, outputDir, failedTracker, nil, fmt.Sprintf("%s %s: %s", tag(colCyan, "scraping"), creatorName, creatorURL))
+	runDownloads(postLinks, creatorName, outputDir, failedTracker, nil)
 }
 
 func runFailedDownloads(outputDir string, failedTracker *failedDownloadTracker) {
@@ -1228,12 +1245,12 @@ func runFailedDownloads(outputDir string, failedTracker *failedDownloadTracker) 
 		selected[failure.PostURL][failure.VideoIndex] = true
 	}
 	fmt.Printf("Retrying %d saved failed download(s) from %d post(s)...\n\n", len(failures), len(posts))
-	runDownloads(posts, creatorName, outputDir, failedTracker, selected, fmt.Sprintf("%s failed downloads for %s", tag(colCyan, "retrying"), creatorName))
+	runDownloads(posts, creatorName, outputDir, failedTracker, selected)
 }
 
 // selected is nil for a normal scrape. Otherwise it limits each freshly read
 // post page to the video positions that previously failed.
-func runDownloads(postLinks []string, creatorName, outputDir string, failedTracker *failedDownloadTracker, selected map[string]map[int]bool, header string) {
+func runDownloads(postLinks []string, creatorName, outputDir string, failedTracker *failedDownloadTracker, selected map[string]map[int]bool) {
 	fmt.Printf("Step 2: reading + downloading (max %d concurrent downloads)...\n\n", maxDownloads)
 
 	var mu sync.Mutex
@@ -1245,15 +1262,13 @@ func runDownloads(postLinks []string, creatorName, outputDir string, failedTrack
 		failed:     &atomic.Int64{},
 	}
 	progress := newDownloadProgress()
-	reporter := newStatusReporter(stats, progress, maxDownloads, &mu, header)
+	reporter := newStatusReporter(stats, progress, maxDownloads, &mu)
 	reporter.Start()
 	var downloadWG sync.WaitGroup
 	downloadSlots := make(chan struct{}, maxDownloads)
 	var totalVideos int
 
 	for i, postURL := range postLinks {
-		result := extractVideos(postURL)
-
 		postID := postIDFromURL(postURL)
 		postLabel := postID
 		if postLabel == "" {
@@ -1268,9 +1283,21 @@ func runDownloads(postLinks []string, creatorName, outputDir string, failedTrack
 				time.Sleep(scrapeDelay())
 			}
 		}
+		result := extractVideos(postURL, func(status int, wait time.Duration) {
+			logPost(colYellow, fmt.Sprintf("warning: HTTP %d - retrying in %ds...", status, int(wait.Seconds())), "")
+		})
 
+		if result.err != nil {
+			logPost(colRed, "warning: "+result.err.Error(), "")
+			waitBeforeNextPost()
+			continue
+		}
 		if len(result.videos) == 0 {
-			logPost(colYellow, "no video", "")
+			status := "no video"
+			if result.hadWarnings {
+				status = "warning: no video"
+			}
+			logPost(colYellow, status, "")
 			waitBeforeNextPost()
 			continue
 		}
