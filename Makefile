@@ -1,6 +1,6 @@
 BINARY_NAME := coomerfans-downloader
 OUT_DIR ?= dist
-VERSION ?= 1.0.0
+VERSION ?= dev
 TARGETS ?= darwin/arm64 linux/amd64 windows/amd64
 
 .DEFAULT_GOAL := build
