@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -50,7 +51,9 @@ func tag(color, label string) string {
 }
 
 const (
-	scrapeDelay = 1500 * time.Millisecond
+	scrapeDelayBase   = 500 * time.Millisecond
+	scrapeDelayJitter = 250 * time.Millisecond
+	maxRateLimitRetry = 10
 )
 
 var (
@@ -130,6 +133,16 @@ func applyHeaders(req *http.Request) {
 	}
 }
 
+func scrapeDelay() time.Duration {
+	return scrapeDelayBase + time.Duration(rand.Intn(2*int(scrapeDelayJitter/time.Millisecond)+1))*time.Millisecond - scrapeDelayJitter
+}
+
+// rateLimitBackoff is shared by scraping and downloads. Attempts start at one:
+// 20s, 40s, 80s, 160s, then cap at 300s.
+func rateLimitBackoff(attempt int) time.Duration {
+	return time.Duration(min((1<<attempt)*10, 300)) * time.Second
+}
+
 // ── HTTP ──────────────────────────────────────────────────────────────────────
 
 func fetch(rawURL string, retries ...int) (string, error) {
@@ -138,7 +151,8 @@ func fetch(rawURL string, retries ...int) (string, error) {
 		maxRetries = retries[0]
 	}
 	lastStatus := 0
-	for attempt := range maxRetries {
+	rateLimitRetries := 0
+	for attempt := 0; attempt < maxRetries; attempt++ {
 		req, err := http.NewRequest("GET", rawURL, nil)
 		if err != nil {
 			return "", err
@@ -149,21 +163,34 @@ func fetch(rawURL string, retries ...int) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		defer resp.Body.Close()
 
 		switch resp.StatusCode {
 		case 200:
 			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
 			if err != nil {
 				return "", err
 			}
 			return string(body), nil
+		case 429:
+			resp.Body.Close()
+			if rateLimitRetries >= maxRateLimitRetry {
+				return "", fmt.Errorf("HTTP 429 after %d retries", maxRateLimitRetry)
+			}
+			rateLimitRetries++
+			wait := rateLimitBackoff(rateLimitRetries)
+			fmt.Printf("\n  "+tag(colRed, "429")+" scraping rate limited, waiting %ds (attempt %d/%d)...\n", int(wait.Seconds()), rateLimitRetries, maxRateLimitRetry)
+			time.Sleep(wait)
+			attempt-- // 429 retries do not consume ordinary transient-error retries.
+			continue
 		case 500, 502, 503, 504:
+			resp.Body.Close()
 			lastStatus = resp.StatusCode
 			wait := time.Duration(attempt+1) * 5 * time.Second
 			fmt.Printf("\n  "+tag(colYellow, "warn")+" HTTP %d, retrying in %ds...\n", resp.StatusCode, int(wait.Seconds()))
 			time.Sleep(wait)
 		default:
+			resp.Body.Close()
 			return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 		}
 	}
@@ -486,7 +513,7 @@ func collectPostLinks(creatorURL string) []string {
 			break
 		}
 		pageURL = absURL(pageURL, nextLink)
-		time.Sleep(scrapeDelay)
+		time.Sleep(scrapeDelay())
 	}
 
 	return allPosts
@@ -735,19 +762,21 @@ type statusReporter struct {
 	progress  *downloadProgress
 	maxActive int
 	outputMu  *sync.Mutex
+	header    string
 	enabled   bool
 	rows      int
 	stop      chan struct{}
 	done      chan struct{}
 }
 
-func newStatusReporter(stats dlStats, progress *downloadProgress, maxActive int, outputMu *sync.Mutex) *statusReporter {
+func newStatusReporter(stats dlStats, progress *downloadProgress, maxActive int, outputMu *sync.Mutex, header string) *statusReporter {
 	info, err := os.Stdout.Stat()
 	return &statusReporter{
 		stats:     stats,
 		progress:  progress,
 		maxActive: maxActive,
 		outputMu:  outputMu,
+		header:    header,
 		enabled:   err == nil && info.Mode()&os.ModeCharDevice != 0,
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
@@ -766,7 +795,7 @@ func (r *statusReporter) Start() {
 		return
 	}
 	rows, err := terminalRows()
-	if err != nil || rows < 2 {
+	if err != nil || rows < 4 {
 		r.enabled = false
 		close(r.done)
 		return
@@ -776,6 +805,7 @@ func (r *statusReporter) Start() {
 	// is not gradually overwritten by the scrolling log region.
 	fmt.Print("\033[2J\033[H")
 	r.setLayoutLocked(rows)
+	fmt.Printf("\033[1;1H\033[2K%s\033[2;1H\033[2K\033[3;1H", r.header)
 	r.outputMu.Unlock()
 	go r.run()
 }
@@ -801,9 +831,10 @@ func (r *statusReporter) run() {
 			seconds := now.Sub(lastTime).Seconds()
 			rate := float64(bytes-lastBytes) / seconds / 1024 / 1024
 			r.outputMu.Lock()
-			// The scroll region reserves the final terminal row for this status.
+			// The scroll region reserves the first row for the scrape header and the
+			// final row for progress.
 			// The log cursor is restored immediately after each redraw.
-			fmt.Printf("\0337\033[%d;1H\033[2K  "+tag(colCyan, "progress")+" downloading: %d/%d | completed: %d/%d | failed: %d | %.1f MB/s\0338",
+			fmt.Printf("\0337\033[%d;1H\033[2K"+tag(colCyan, "progress")+" downloading: %d/%d | completed: %d/%d | failed: %d | %.1f MB/s\0338",
 				r.rows,
 				active, r.maxActive, r.stats.downloaded.Load(), r.stats.found.Load(), r.stats.failed.Load(), rate)
 			r.outputMu.Unlock()
@@ -818,9 +849,8 @@ func (r *statusReporter) run() {
 }
 
 func (r *statusReporter) setLayoutLocked(rows int) {
-	// Restrict regular output to every row except the final one. This makes the
-	// status a real, reserved terminal row instead of an ordinary log line.
-	fmt.Printf("\033[1;%dr", rows-1)
+	// Reserve the title and one empty line above the scrolling log region.
+	fmt.Printf("\033[3;%dr", rows-1)
 	r.rows = rows
 }
 
@@ -929,14 +959,14 @@ func downloadVideo(rawURL, title, postURL, creatorName string, index, videoIndex
 		if err != nil {
 			soFar := resp.BytesComplete()
 			if resp.HTTPResponse != nil && resp.HTTPResponse.StatusCode == 429 {
-				if retries >= 10 {
-					errorf(soFar, fmt.Sprintf("gave up after 10 retries for %q", title))
+				if retries >= maxRateLimitRetry {
+					errorf(soFar, fmt.Sprintf("gave up after %d retries for %q", maxRateLimitRetry, title))
 					return
 				}
 				retries++
-				wait := time.Duration(min(1<<retries*10, 300)) * time.Second
-				reporter.Printf("\n  "+tag(colRed, "429")+" rate limited, waiting %ds (attempt %d/10) for %q...\n",
-					int(wait.Seconds()), retries, title)
+				wait := rateLimitBackoff(retries)
+				reporter.Printf("\n  "+tag(colRed, "429")+" rate limited, waiting %ds (attempt %d/%d) for %q...\n",
+					int(wait.Seconds()), retries, maxRateLimitRetry, title)
 				time.Sleep(wait)
 				continue
 			}
@@ -1017,7 +1047,7 @@ Examples:
   coomerfans https://coomerfans.com/u/onlyfans/1234567/hotbabe96
   coomerfans hotbabe96 -o ~/Videos/hotbabe86 -c 4
   coomerfans hotbabe96 -o ~/Videos/hotbabe86 -c 12 --filename-length 64
- 
+
 `, version)
 			os.Exit(0)
 		case "--version", "-v":
@@ -1178,7 +1208,7 @@ func runScrapeAndDownload(creatorURL, outputDir string, failedTracker *failedDow
 	postLinks := collectPostLinks(creatorURL)
 	fmt.Printf("  -> %d posts found\n\n", len(postLinks))
 
-	runDownloads(postLinks, creatorName, outputDir, failedTracker, nil)
+	runDownloads(postLinks, creatorName, outputDir, failedTracker, nil, fmt.Sprintf("%s %s: %s", tag(colCyan, "scraping"), creatorName, creatorURL))
 }
 
 func runFailedDownloads(outputDir string, failedTracker *failedDownloadTracker) {
@@ -1198,12 +1228,12 @@ func runFailedDownloads(outputDir string, failedTracker *failedDownloadTracker) 
 		selected[failure.PostURL][failure.VideoIndex] = true
 	}
 	fmt.Printf("Retrying %d saved failed download(s) from %d post(s)...\n\n", len(failures), len(posts))
-	runDownloads(posts, creatorName, outputDir, failedTracker, selected)
+	runDownloads(posts, creatorName, outputDir, failedTracker, selected, fmt.Sprintf("%s failed downloads for %s", tag(colCyan, "retrying"), creatorName))
 }
 
 // selected is nil for a normal scrape. Otherwise it limits each freshly read
 // post page to the video positions that previously failed.
-func runDownloads(postLinks []string, creatorName, outputDir string, failedTracker *failedDownloadTracker, selected map[string]map[int]bool) {
+func runDownloads(postLinks []string, creatorName, outputDir string, failedTracker *failedDownloadTracker, selected map[string]map[int]bool, header string) {
 	fmt.Printf("Step 2: reading + downloading (max %d concurrent downloads)...\n\n", maxDownloads)
 
 	var mu sync.Mutex
@@ -1215,34 +1245,57 @@ func runDownloads(postLinks []string, creatorName, outputDir string, failedTrack
 		failed:     &atomic.Int64{},
 	}
 	progress := newDownloadProgress()
-	reporter := newStatusReporter(stats, progress, maxDownloads, &mu)
+	reporter := newStatusReporter(stats, progress, maxDownloads, &mu, header)
 	reporter.Start()
 	var downloadWG sync.WaitGroup
 	downloadSlots := make(chan struct{}, maxDownloads)
 	var totalVideos int
 
 	for i, postURL := range postLinks {
-		mu.Lock()
-		fmt.Printf("\n  "+bold+colDefault+"[%d/%d]"+reset+" reading %s\n", i+1, len(postLinks), postURL)
-		mu.Unlock()
-
 		result := extractVideos(postURL)
 
-		mu.Lock()
-		if len(result.videos) > 0 {
-			fmt.Printf("  -> %d video(s) %q\n", len(result.videos), result.title)
-		} else {
-			fmt.Println("  -> no video")
-		}
-		mu.Unlock()
-
 		postID := postIDFromURL(postURL)
-		if selected == nil && postAlreadyDownloaded(outputDir, postID) {
-			mu.Lock()
-			fmt.Printf("\n  "+tag(colTeal, "skip")+" (post ID already exists) %s\n", result.title)
-			mu.Unlock()
+		postLabel := postID
+		if postLabel == "" {
+			postLabel = "?"
+		}
+		logPost := func(color, status, detail string) {
+			reporter.Printf("  "+bold+colDefault+"[%d/%d]"+reset+" Post #%s: "+bold+color+"%s"+reset+"%s (%s)\n",
+				i+1, len(postLinks), postLabel, status, detail, postURL)
+		}
+		waitBeforeNextPost := func() {
+			if i < len(postLinks)-1 {
+				time.Sleep(scrapeDelay())
+			}
+		}
+
+		if len(result.videos) == 0 {
+			logPost(colYellow, "no video", "")
+			waitBeforeNextPost()
 			continue
 		}
+		if selected == nil && postAlreadyDownloaded(outputDir, postID) {
+			logPost(colTeal, "skip existing", fmt.Sprintf(" (%q)", result.title))
+			waitBeforeNextPost()
+			continue
+		}
+
+		selectedVideos := 0
+		for vi := range result.videos {
+			if selected == nil || selected[postURL][vi] {
+				selectedVideos++
+			}
+		}
+		if selectedVideos == 0 {
+			logPost(colYellow, "no matching failed video", "")
+			waitBeforeNextPost()
+			continue
+		}
+		status := "downloading"
+		if selectedVideos > 1 {
+			status = fmt.Sprintf("downloading %d videos", selectedVideos)
+		}
+		logPost(colCyan, status, fmt.Sprintf(" (%q)", result.title))
 
 		for vi, u := range result.videos {
 			if selected != nil && !selected[postURL][vi] {
@@ -1262,15 +1315,11 @@ func runDownloads(postLinks []string, creatorName, outputDir string, failedTrack
 			go func() {
 				defer downloadWG.Done()
 				defer func() { <-downloadSlots }()
-				reporter.Printf("\n  "+tag(colCyan, "downloading")+" %s %s\n", itemTitle, stats.format())
-
 				downloadVideo(u, itemTitle, postURL, creatorName, itemIndex, vi, outputDir, stats, progress, reporter, failedTracker)
 			}()
 		}
 
-		if i < len(postLinks)-1 {
-			time.Sleep(scrapeDelay)
-		}
+		waitBeforeNextPost()
 	}
 
 	reporter.Printf("\nAll posts received - waiting for the remaining downloads to finish...\n")

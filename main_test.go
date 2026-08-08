@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPostIDFromURL(t *testing.T) {
@@ -94,5 +95,30 @@ func TestFailedDownloadTrackerPersistsAndRemovesRecords(t *testing.T) {
 	}
 	if _, err := os.Stat(failedDownloadsPath(dir)); !os.IsNotExist(err) {
 		t.Fatalf("failure file still exists: %v", err)
+	}
+}
+
+func TestRateLimitBackoff(t *testing.T) {
+	for attempt, want := range map[int]time.Duration{
+		1: 20 * time.Second,
+		2: 40 * time.Second,
+		3: 80 * time.Second,
+		4: 160 * time.Second,
+		5: 300 * time.Second,
+	} {
+		if got := rateLimitBackoff(attempt); got != want {
+			t.Errorf("rateLimitBackoff(%d) = %s, want %s", attempt, got, want)
+		}
+	}
+}
+
+func TestScrapeDelayStaysWithinJitterRange(t *testing.T) {
+	for range 100 {
+		got := scrapeDelay()
+		minDelay := scrapeDelayBase - scrapeDelayJitter
+		maxDelay := scrapeDelayBase + scrapeDelayJitter
+		if got < minDelay || got > maxDelay {
+			t.Fatalf("scrapeDelay() = %s, want between %s and %s", got, minDelay, maxDelay)
+		}
 	}
 }
