@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -560,6 +561,7 @@ func postAlreadyDownloaded(outputDir, postID string) bool {
 type dlStats struct {
 	downloaded *atomic.Int64
 	active     *atomic.Int64
+	found      *atomic.Int64
 	totalBytes *atomic.Int64
 	failed     *atomic.Int64
 }
@@ -576,6 +578,157 @@ func (s dlStats) summary(intervalBytes int64, intervalSecs float64) string {
 	mbps := intervalMB / intervalSecs
 	return fmt.Sprintf("active: %d, done: %d, failed: %d, %.1f MB total @ %.1f MB/s",
 		s.active.Load(), s.downloaded.Load(), s.failed.Load(), totalMB, mbps)
+}
+
+// downloadProgress tracks only bytes transferred during this run. In
+// particular, bytes already present in a resumed .part file are excluded so
+// they cannot inflate the displayed transfer rate.
+type downloadProgress struct {
+	mu        sync.Mutex
+	active    map[*grab.Response]int64
+	completed int64
+}
+
+func newDownloadProgress() *downloadProgress {
+	return &downloadProgress{active: make(map[*grab.Response]int64)}
+}
+
+func (p *downloadProgress) add(resp *grab.Response) {
+	p.mu.Lock()
+	p.active[resp] = resp.BytesComplete()
+	p.mu.Unlock()
+}
+
+func (p *downloadProgress) remove(resp *grab.Response) {
+	p.mu.Lock()
+	if start, ok := p.active[resp]; ok {
+		p.completed += max(0, resp.BytesComplete()-start)
+		delete(p.active, resp)
+	}
+	p.mu.Unlock()
+}
+
+func (p *downloadProgress) snapshot() (bytes int64, active int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	bytes = p.completed
+	for resp, start := range p.active {
+		bytes += max(0, resp.BytesComplete()-start)
+	}
+	return bytes, len(p.active)
+}
+
+// statusReporter maintains one sticky terminal line at the bottom of an
+// interactive terminal, without moving the cursor used for normal log output.
+type statusReporter struct {
+	stats     dlStats
+	progress  *downloadProgress
+	maxActive int
+	outputMu  *sync.Mutex
+	enabled   bool
+	rows      int
+	stop      chan struct{}
+	done      chan struct{}
+}
+
+func newStatusReporter(stats dlStats, progress *downloadProgress, maxActive int, outputMu *sync.Mutex) *statusReporter {
+	info, err := os.Stdout.Stat()
+	return &statusReporter{
+		stats:     stats,
+		progress:  progress,
+		maxActive: maxActive,
+		outputMu:  outputMu,
+		enabled:   err == nil && info.Mode()&os.ModeCharDevice != 0,
+		stop:      make(chan struct{}),
+		done:      make(chan struct{}),
+	}
+}
+
+func (r *statusReporter) Printf(format string, args ...any) {
+	r.outputMu.Lock()
+	fmt.Printf(format, args...)
+	r.outputMu.Unlock()
+}
+
+func (r *statusReporter) Start() {
+	if !r.enabled {
+		close(r.done)
+		return
+	}
+	rows, err := terminalRows()
+	if err != nil || rows < 2 {
+		r.enabled = false
+		close(r.done)
+		return
+	}
+	r.outputMu.Lock()
+	// Start the dedicated layout with a clean screen so existing shell output
+	// is not gradually overwritten by the scrolling log region.
+	fmt.Print("\033[2J\033[H")
+	r.setLayoutLocked(rows)
+	r.outputMu.Unlock()
+	go r.run()
+}
+
+func (r *statusReporter) Stop() {
+	if r.enabled {
+		close(r.stop)
+	}
+	<-r.done
+}
+
+func (r *statusReporter) run() {
+	defer close(r.done)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	lastTime := time.Now()
+	lastBytes, _ := r.progress.snapshot()
+	for {
+		select {
+		case now := <-ticker.C:
+			bytes, active := r.progress.snapshot()
+			seconds := now.Sub(lastTime).Seconds()
+			rate := float64(bytes-lastBytes) / seconds / 1024 / 1024
+			r.outputMu.Lock()
+			// The scroll region reserves the final terminal row for this status.
+			// The log cursor is restored immediately after each redraw.
+			fmt.Printf("\0337\033[%d;1H\033[2K  "+tag(colCyan, "progress")+" downloading: %d/%d | completed: %d/%d | failed: %d | %.1f MB/s\0338",
+				r.rows,
+				active, r.maxActive, r.stats.downloaded.Load(), r.stats.found.Load(), r.stats.failed.Load(), rate)
+			r.outputMu.Unlock()
+			lastTime, lastBytes = now, bytes
+		case <-r.stop:
+			r.outputMu.Lock()
+			fmt.Printf("\0337\033[%d;1H\033[2K\033[r\0338", r.rows)
+			r.outputMu.Unlock()
+			return
+		}
+	}
+}
+
+func (r *statusReporter) setLayoutLocked(rows int) {
+	// Restrict regular output to every row except the final one. This makes the
+	// status a real, reserved terminal row instead of an ordinary log line.
+	fmt.Printf("\033[1;%dr", rows-1)
+	r.rows = rows
+}
+
+func terminalRows() (int, error) {
+	if runtime.GOOS == "windows" {
+		return 0, fmt.Errorf("terminal layout is not supported on Windows")
+	}
+	cmd := exec.Command("stty", "size")
+	cmd.Stdin = os.Stdin
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	var rows, columns int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(output)), "%d %d", &rows, &columns); err != nil || rows < 2 {
+		return 0, fmt.Errorf("could not determine terminal size")
+	}
+	return rows, nil
 }
 
 func buildDownloadRequest(rawURL string) (*http.Request, error) {
@@ -610,7 +763,7 @@ func buildDownloadRequest(rawURL string) (*http.Request, error) {
 	return req, nil
 }
 
-func downloadVideo(rawURL, title, postURL, creatorName string, index int, outputDir string, stats dlStats, mu *sync.Mutex) {
+func downloadVideo(rawURL, title, postURL, creatorName string, index int, outputDir string, stats dlStats, progress *downloadProgress, reporter *statusReporter) {
 	stats.active.Add(1)
 	defer stats.active.Add(-1)
 
@@ -623,14 +776,12 @@ func downloadVideo(rawURL, title, postURL, creatorName string, index int, output
 
 	// errorf prints a concise error line followed by file context for debugging.
 	errorf := func(soFar int64, reason string) {
-		mu.Lock()
 		stats.failed.Add(1)
-		fmt.Printf("\n  "+tag(colRed, "error")+" %s\n", stats.format())
-		fmt.Printf("  download of video %q failed because %s\n", title, reason)
-		fmt.Printf("  -> post:  %s\n", postURL)
-		fmt.Printf("  -> video: %s\n", rawURL)
-		fmt.Printf("  -> downloaded so far: %.1f MB\n", float64(soFar)/1024/1024)
-		mu.Unlock()
+		reporter.Printf("\n  "+tag(colRed, "error")+" %s\n", stats.format())
+		reporter.Printf("  download of video %q failed because %s\n", title, reason)
+		reporter.Printf("  -> post:  %s\n", postURL)
+		reporter.Printf("  -> video: %s\n", rawURL)
+		reporter.Printf("  -> downloaded so far: %.1f MB\n", float64(soFar)/1024/1024)
 	}
 
 	retries := 0
@@ -652,7 +803,17 @@ func downloadVideo(rawURL, title, postURL, creatorName string, index int, output
 		req.HTTPRequest.Header = httpReq.Header
 
 		resp := grabClient.Do(req)
-		if err := resp.Err(); err != nil {
+		// A response with a successful HTTP status has an initialized transfer
+		// that can safely be sampled by the live progress reporter.
+		trackProgress := resp.HTTPResponse != nil && resp.HTTPResponse.StatusCode >= 200 && resp.HTTPResponse.StatusCode < 300
+		if trackProgress {
+			progress.add(resp)
+		}
+		err = resp.Err()
+		if trackProgress {
+			progress.remove(resp)
+		}
+		if err != nil {
 			soFar := resp.BytesComplete()
 			if resp.HTTPResponse != nil && resp.HTTPResponse.StatusCode == 429 {
 				if retries >= 10 {
@@ -661,10 +822,8 @@ func downloadVideo(rawURL, title, postURL, creatorName string, index int, output
 				}
 				retries++
 				wait := time.Duration(min(1<<retries*10, 300)) * time.Second
-				mu.Lock()
-				fmt.Printf("\n  "+tag(colRed, "429")+" rate limited, waiting %ds (attempt %d/10) for %q...\n",
+				reporter.Printf("\n  "+tag(colRed, "429")+" rate limited, waiting %ds (attempt %d/10) for %q...\n",
 					int(wait.Seconds()), retries, title)
-				mu.Unlock()
 				time.Sleep(wait)
 				continue
 			}
@@ -685,10 +844,8 @@ func downloadVideo(rawURL, title, postURL, creatorName string, index int, output
 		} else {
 			stats.totalBytes.Add(resp.Size())
 		}
-		mu.Lock()
-		fmt.Printf("\n  "+tag(colGreen, "done")+" %s (%.1f MB) %s\n",
+		reporter.Printf("\n  "+tag(colGreen, "done")+" %s (%.1f MB) %s\n",
 			filename, float64(resp.Size())/1024/1024, stats.format())
-		mu.Unlock()
 		return
 	}
 }
@@ -876,9 +1033,15 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 	stats := dlStats{
 		downloaded: &atomic.Int64{},
 		active:     &atomic.Int64{},
+		found:      &atomic.Int64{},
 		totalBytes: &atomic.Int64{},
 		failed:     &atomic.Int64{},
 	}
+	progress := newDownloadProgress()
+	reporter := newStatusReporter(stats, progress, maxDownloads, &mu)
+	reporter.Start()
+	var downloadWG sync.WaitGroup
+	downloadSlots := make(chan struct{}, maxDownloads)
 	var totalVideos int
 
 	for i, postURL := range postLinks {
@@ -906,24 +1069,23 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 
 		for vi, u := range result.videos {
 			totalVideos++
+			stats.found.Add(1)
+			itemIndex := totalVideos
 			itemTitle := result.title
 			if len(result.videos) > 1 {
 				itemTitle = fmt.Sprintf("%s (%d)", result.title, vi+1)
 			}
 
-			// Spawn download goroutine immediately - no queuing!
+			// Wait for a free slot before starting another download.
+			downloadSlots <- struct{}{}
+			downloadWG.Add(1)
 			go func() {
-				mu.Lock()
-				fmt.Printf("\n  "+tag(colCyan, "downloading")+" %s %s\n", itemTitle, stats.format())
-				mu.Unlock()
+				defer downloadWG.Done()
+				defer func() { <-downloadSlots }()
+				reporter.Printf("\n  "+tag(colCyan, "downloading")+" %s %s\n", itemTitle, stats.format())
 
-				downloadVideo(u, itemTitle, postURL, creatorName, totalVideos, outputDir, stats, &mu)
+				downloadVideo(u, itemTitle, postURL, creatorName, itemIndex, outputDir, stats, progress, reporter)
 			}()
-
-			// Wait for a slot to become available (limit concurrency to maxDownloads)
-			for stats.active.Load() >= int64(maxDownloads) {
-				time.Sleep(100 * time.Millisecond)
-			}
 		}
 
 		if i < len(postLinks)-1 {
@@ -931,19 +1093,9 @@ func runScrapeAndDownload(creatorURL, outputDir string) {
 		}
 	}
 
-	fmt.Println()
-	fmt.Println("All posts received - waiting for the last downloads to finish...")
-
-	// Wait for all downloads to complete
-	var wg sync.WaitGroup
-	for range maxDownloads {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			time.Sleep(2 * time.Second) // Give downloads time to finish
-		}()
-	}
-	wg.Wait()
+	reporter.Printf("\nAll posts received - waiting for the remaining downloads to finish...\n")
+	downloadWG.Wait()
+	reporter.Stop()
 
 	fmt.Println()
 	fmt.Println("=== Done ===")
