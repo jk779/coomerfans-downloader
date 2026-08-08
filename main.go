@@ -38,12 +38,13 @@ type config struct {
 const (
 	reset      = "\033[0m"
 	bold       = "\033[1m"
-	colCyan    = "\033[36m"      // downloading
-	colGreen   = "\033[32m"      // done (green-yellow)
-	colTeal    = "\033[38;5;28m" // skip (darker green)
-	colYellow  = "\033[33m"      // wait
-	colRed     = "\033[31m"      // error
-	colDefault = "\033[39m"      // normal text
+	colCyan    = "\033[36m"       // downloading
+	colGreen   = "\033[32m"       // done (green-yellow)
+	colTeal    = "\033[38;5;28m"  // skip (darker green)
+	colGray    = "\033[38;5;245m" // neutral status
+	colYellow  = "\033[33m"       // wait
+	colRed     = "\033[31m"       // error
+	colDefault = "\033[39m"       // normal text
 )
 
 func tag(color, label string) string {
@@ -1294,10 +1295,12 @@ func runDownloads(postLinks []string, creatorName, outputDir string, failedTrack
 		}
 		if len(result.videos) == 0 {
 			status := "no video"
+			color := colGray
 			if result.hadWarnings {
 				status = "warning: no video"
+				color = colYellow
 			}
-			logPost(colYellow, status, "")
+			logPost(color, status, "")
 			waitBeforeNextPost()
 			continue
 		}
