@@ -2,40 +2,64 @@
 
 Download videos from coomerfans.com creator pages.
 
-## Download
+## Installation
 
-Pre-built binaries are available on the [releases page](https://github.com/jk779/coomerfans-downloader/releases).
+### macOS / Linux
 
-### Unverified Downloads
+Install the latest release with:
 
-These binaries are **not code-signed**, but are built and released by a Github Action. You will see warnings from your OS when first opening them.
-
-**macOS**: Gatekeeper will block the binary. Run this command to disable Gatekeeper for this file.
-```
-xattr -d com.apple.quarantine ~/Downloads/coomerfans-downloader-darwin-arm64
+```sh
+curl -fL https://get.coomerfans.download/bash | bash
 ```
 
-**Windows**: If SmartScreen blocks the executable, click "More info" → "Run anyway".
+The installer:
+
+- detects your operating system and architecture
+- downloads the latest matching release
+- installs it as `~/.local/bin/coomerfans-downloader`
+- makes the binary executable
+- checks whether `~/.local/bin` is already in your `PATH`
+- asks before modifying your shell profile if a `PATH` update is needed
+
+No `sudo` or system-wide installation is used.
+
+Supported installer targets:
+
+- macOS Apple Silicon (`darwin/arm64`)
+- Linux x86-64 (`linux/amd64`)
+- Linux ARM64 (`linux/arm64`)
+
+### Windows
+
+Download the latest Windows executable from the [releases page](https://github.com/jk779/coomerfans-downloader/releases).
+
+If SmartScreen blocks the executable, click **More info** → **Run anyway**.
+
+### Manual downloads
+
+Pre-built binaries for all supported platforms are available on the [releases page](https://github.com/jk779/coomerfans-downloader/releases).
+
+The binaries are built automatically by GitHub Actions and are currently not code-signed.
 
 ## Build from source
 
 ```sh
-make                     # default: macOS Apple Silicon, Linux x86-64, Windows x86-64
-make VERSION=1.2.0
-make TARGETS="darwin/arm64 windows/arm64" VERSION=1.2.0
+make                     # default: macOS Apple Silicon, Linux x86-64/arm64, Windows x86-64
+make VERSION=dev
+make TARGETS="darwin/arm64 windows/arm64" VERSION=1.2.3
 ```
 
 Binaries are written to `dist/`. Run `make help` for the available options.
 
 ## Usage
 
-```
+```text
 coomerfans-downloader [creator_name_or_url] [options]
 ```
 
 ## Examples
 
-```
+```sh
 coomerfans-downloader hotbabe96
 coomerfans-downloader https://coomerfans.com/u/onlyfans/1234567/hotbabe96
 coomerfans-downloader hotbabe96 -o ~/Videos -c 4
@@ -46,9 +70,9 @@ coomerfans-downloader hotbabe96 -o ~/Videos -c 4
 | Flag | Description |
 |------|-------------|
 | `-o, --output-dir DIR` | Download directory (default: `./creator-name/`) |
-| `-c, --concurrency N` | Parallel downloads (default: 8) |
+| `-c, --concurrency N` | Parallel downloads (default: 8, coomerfans limits to 20 concurrent connections) |
 | `--filename-length N` | Maximum filename length including extension (default: 100) |
-| `--failed-only` | Retry only the saved failed downloads; does not scrape creator indexes |
+| `--failed-only` | Retry only the saved failed downloads; does not scrape creator |
 | `-v, --version` | Print version |
 | `-h, --help` | Show help |
 

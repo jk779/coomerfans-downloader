@@ -1,7 +1,7 @@
 BINARY_NAME := coomerfans-downloader
 OUT_DIR ?= dist
 VERSION ?= dev
-TARGETS ?= darwin/arm64 linux/amd64 windows/amd64
+TARGETS ?= darwin/arm64 linux/amd64 linux/arm64 windows/amd64
 
 .DEFAULT_GOAL := build
 
@@ -30,9 +30,9 @@ help:
 		'Usage:' \
 		'  make [build] [VERSION=X.Y.Z] [TARGETS="GOOS/GOARCH ..."]' \
 		'' \
-		'Default targets: darwin/arm64, linux/amd64, windows/amd64' \
+		'Default targets: darwin/arm64, linux/amd64, linux/arm64, windows/amd64' \
 		'' \
 		'Examples:' \
 		'  make' \
-		'  make VERSION=1.2.0' \
-		'  make TARGETS="darwin/arm64 windows/arm64" VERSION=1.2.0'
+		'  make VERSION=1.2.3' \
+		'  make TARGETS="darwin/arm64 linux/arm64 windows/arm64" VERSION=1.2.3'

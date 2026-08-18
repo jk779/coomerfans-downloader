@@ -11,9 +11,42 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require annotated tag
+        run: |
+          git fetch --force origin \
+            "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+
+          if ! git rev-parse "$GITHUB_REF_NAME^{tag}" >/dev/null 2>&1; then
+            echo "Error: $GITHUB_REF_NAME is not an annotated tag."
+            echo
+            echo "Releases must use annotated tags, for example:"
+            echo "  git tag -a $GITHUB_REF_NAME -m 'Release notes here'"
+            echo "  git push origin $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - name: Extract release notes
+        id: notes
+        run: |
+          SUBJECT="$(git for-each-ref "refs/tags/$GITHUB_REF_NAME" --format='%(contents:subject)')"
+
+          git for-each-ref "refs/tags/$GITHUB_REF_NAME" --format='%(contents:body)' \
+            > release-notes.md
+
+          echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
+
+          echo "Release title:"
+          echo "  $GITHUB_REF_NAME: $SUBJECT"
+          echo
+          echo "Release notes:"
+          cat release-notes.md
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -32,13 +65,16 @@ jobs:
 
       - name: Prepare release assets
         id: assets
-        run: echo "files=$(find dist -maxdepth 1 -type f ! -name '.gitkeep' | tr '\n' ',')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "files=$(find dist -maxdepth 1 -type f ! -name '.gitkeep' | tr '\n' ',')" \
+            >> "$GITHUB_OUTPUT"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "Release ${{ github.ref_name }}"
+          name: "${{ github.ref_name }}: ${{ steps.notes.outputs.subject }}"
+          body_path: release-notes.md
           draft: false
           prerelease: false
           files: ${{ steps.assets.outputs.files }}
